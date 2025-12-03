@@ -1,0 +1,48 @@
+# ---- Python 기본 ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+
+# ---- 가상환경 ----
+venv/
+.env/
+.venv/
+env/
+ENV/
+
+# ---- IDE / 에디터 설정 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- OS별 잡파일 ----
+.DS_Store
+Thumbs.db
+
+# ---- 로그 / 임시 파일 ----
+*.log
+*.tmp
+
+# ---- 환경 변수/보안 파일 ----
+.env
+.env.*
+*.secret
+*.key
+token.json
+
+# ---- Docker 관련 ----
+docker-compose.override.yml
+.env.docker
+
+# ---- 기타 캐시 ----
+.mypy_cache/
+.pytest_cache/
+.cache/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
