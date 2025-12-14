@@ -1,222 +1,262 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Any
-
-from openai import OpenAI, APIError
+from typing import Any, Dict, Optional
 
 from app.core.config import settings
+
+# OpenAI 클라이언트 import (v1 / v0 양쪽 호환 시도)
+try:
+    from openai import OpenAI
+
+    _HAS_OPENAI_CLIENT = True
+except ImportError:  # fallback to legacy openai
+    import openai  # type: ignore
+
+    OpenAI = None  # type: ignore
+    _HAS_OPENAI_CLIENT = False
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class LLMReplyRequest:
     """
-    TONO V3 LLM 요청 DTO.
-
-    V3:
-      - context: ReplyContext.to_dict() 결과 (지식 기반 응답용)
-    V2 호환:
-      - context 가 None이면, 템플릿을 자연스럽게 다듬는 모드로 동작
+    AutoReplyService → LLMClient 로 전달되는 요청 DTO.
     """
 
     intent: str
     guest_message: str
     locale: str
+    context: Dict[str, Any]
     template_body: str | None = None
-
-    # V3: 지식 기반 응답에 사용
-    context: dict[str, Any] | None = None
-
-    # V2 호환: 이전 코드에서 넘기던 property_code (지금은 단순 프롬프트용)
     property_code: str | None = None
 
 
 class LLMClient:
     """
-    OpenAI GPT-4.1 / GPT-4.1-mini 클라이언트 래퍼.
+    OpenAI 기반 LLM 클라이언트.
 
-    - settings.LLM_API_KEY, settings.LLM_MODEL 사용
-    - self.enabled == False 이면 템플릿 또는 fallback 문구 반환
-    - 예외 발생 시에도 서비스 다운 없이 fallback
+    - settings.LLM_API_KEY, settings.LLM_MODEL 을 사용
+    - self.enabled == False 인 경우 템플릿 또는 기본 문구를 그대로 반환
+    - 예외 발생 시에도 서비스 다운 없이 fallback 처리
     """
 
-    def __init__(self, api_key: str | None, model: str):
-        self.api_key = api_key
-        self.model = model
-        self._client: OpenAI | None = None
+    def __init__(
+        self,
+        api_key: str | None,
+        model: str | None,
+    ) -> None:
+        self._api_key = api_key
+        self._model = model or "gpt-4.1-mini"
 
-        if api_key:
-            self._client = OpenAI(api_key=api_key)
+        if not api_key:
+            self._client = None
+        else:
+            if _HAS_OPENAI_CLIENT:
+                self._client = OpenAI(api_key=api_key)
+            else:
+                # legacy openai 설정
+                openai.api_key = api_key  # type: ignore
+                self._client = None
 
     @property
     def enabled(self) -> bool:
-        return self._client is not None and bool(self.model)
-
-    # --- public API ---
+        return bool(self._api_key and self._model)
 
     def generate_reply(self, req: LLMReplyRequest) -> str:
         """
-        - req.context 가 있으면: 지식 기반 컨텍스트 모드 (V3)
-        - req.context 가 없으면: 템플릿 refine 모드 (V2 호환)
+        컨텍스트 기반 자동응답 생성.
+
+        원칙:
+          - JSON 컨텍스트에 포함된 정보만 사용
+          - 모르면 모른다고 말하기
+          - 브랜드 톤은 컨텍스트(extra_metadata 등)에 정의된 범위 내에서만 적용
         """
 
         if not self.enabled:
-            return self._fallback_reply(req)
+            logger.info(
+                "llm_disabled_fallback intent=%s property_code=%s",
+                req.intent,
+                req.property_code,
+            )
+            if req.template_body:
+                return req.template_body
+            return self._default_fallback_reply(locale=req.locale)
+
+        system_prompt = self._build_system_prompt(req)
+        user_prompt = self._build_user_prompt(req)
+
+        # DEBUG: LLM 호출 전 최소 정보만 로그 (context 전체는 AutoReplyService 쪽에서 찍음)
+        try:
+            logger.debug(
+                "llm_request_meta %s",
+                json.dumps(
+                    {
+                        "intent": req.intent,
+                        "property_code": req.property_code,
+                        "locale": req.locale,
+                        "has_template": bool(req.template_body),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        except Exception:
+            logger.debug("llm_request_meta_log_failed", exc_info=True)
 
         try:
-            if req.context is not None:
-                return self._generate_with_context(req)
-            return self._generate_template_refine(req)
-        except APIError:
-            return self._fallback_reply(req)
-        except Exception:
-            return self._fallback_reply(req)
+            if _HAS_OPENAI_CLIENT and self._client is not None:
+                # openai>=1.x 스타일
+                completion = self._client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.3,
+                )
+                reply = completion.choices[0].message.content.strip()
+            else:
+                # legacy openai.ChatCompletion 스타일
+                completion = openai.ChatCompletion.create(  # type: ignore
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.3,
+                )
+                reply = completion["choices"][0]["message"]["content"].strip()  # type: ignore
 
-    # --- V3: 컨텍스트 기반 모드 ---
+            logger.debug("llm_reply_generated length=%s", len(reply))
+            return reply
 
-    def _generate_with_context(self, req: LLMReplyRequest) -> str:
-        assert self._client is not None
+        except Exception as e:
+            logger.warning(
+                "llm_call_failed intent=%s property_code=%s error=%r",
+                req.intent,
+                req.property_code,
+                e,
+                exc_info=True,
+            )
+            if req.template_body:
+                return req.template_body
+            return self._default_fallback_reply(locale=req.locale)
 
-        system_prompt = self._build_system_prompt_with_context(locale=req.locale)
+    # -------------------------------------------------- #
+
+    def _build_system_prompt(self, req: LLMReplyRequest) -> str:
+        """
+        LLM에게 '이 JSON 컨텍스트에 있는 정보만 사용하라'를 강하게 규정하는 system prompt.
+        """
+
+        locale = req.locale or "ko"
+        # 언어별 기본 톤은 일단 한국어/영어만 구분
+        if locale.startswith("ko"):
+            base = (
+                "당신은 숙박업소 게스트 문의에 답변하는 한국어 고객 응대 어시스턴트입니다. "
+                "다음 JSON 컨텍스트에 포함된 정보만 사용해서 답변해야 합니다. "
+                "컨텍스트에 없는 정보는 절대 추측하지 말고, "
+                "'해당 정보는 전달해주신 정보를 담당자가 확인 후 안내드리겠다'고 안내하세요. "
+                "친절하고 차분한 톤으로, 너무 길지 않게 핵심 위주로 답변하세요."
+            )
+        else:
+            base = (
+                "You are a guest messaging assistant for a lodging operation. "
+                "You must answer ONLY using the information contained in the provided JSON context. "
+                "If something is not present in the context, explicitly say that the information "
+                "is not available in the system instead of guessing. "
+                "Use a polite, calm tone and keep the answer concise but helpful."
+            )
+
+        return base
+
+    def _build_user_prompt(self, req: LLMReplyRequest) -> str:
+        """
+        게스트 메시지 + Intent + Context JSON 을 하나의 user prompt 로 구성.
+        """
         context_json = json.dumps(req.context, ensure_ascii=False, indent=2)
 
-        template_hint = ""
-        if req.template_body:
-            template_hint = (
-                "\n\n---\n"
-                "Below is an optional reply template that you may use as a starting point. "
-                "You MAY rewrite it to better fit the guest message, but do NOT contradict "
-                "any policies in the JSON context.\n"
-                f"TEMPLATE:\n{req.template_body}"
-            )
-
-        user_content = (
-            f"# Guest Message\n"
-            f"{req.guest_message}\n\n"
-            f"# Intent\n"
-            f"{req.intent}\n\n"
-            f"# Context JSON\n"
-            f"{context_json}"
-            f"{template_hint}"
-        )
-
-        completion = self._client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.3,
-            max_tokens=800,
-        )
-
-        msg = completion.choices[0].message.content or ""
-        return msg.strip()
-
-    # --- V2 호환: 템플릿 refine 모드 ---
-
-    def _generate_template_refine(self, req: LLMReplyRequest) -> str:
-        """
-        컨텍스트 없이 템플릿을 자연스럽게 다듬는 모드.
-        property_code 는 단순 메타 정보 문구로만 사용.
-        """
-        assert self._client is not None
-
-        system_prompt = self._build_system_prompt_template_refine(locale=req.locale)
-
-        meta = ""
-        if req.property_code:
-            meta = f"(property_code: {req.property_code})"
-
-        base_template = req.template_body or self._fallback_reply(req)
-
-        user_content = (
-            f"# Guest Message {meta}\n"
-            f"{req.guest_message}\n\n"
-            f"# Draft Reply Template\n"
-            f"{base_template}\n\n"
-            f"Please rewrite or adjust the draft reply so that it answers the guest"
-            f" message clearly and naturally. Keep the original policy meaning."
-        )
-
-        completion = self._client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.4,
-            max_tokens=800,
-        )
-
-        msg = completion.choices[0].message.content or ""
-        return msg.strip()
-
-    # --- 공통 헬퍼 ---
-
-    def _fallback_reply(self, req: LLMReplyRequest) -> str:
-        if req.template_body:
-            return req.template_body
-
         if req.locale.startswith("ko"):
-            return (
-                "문의 주셔서 감사합니다. 게스트님, "
-                "담당자가 곧 직접 확인 후 다시 안내드리겠습니다."
-            )
-        if req.locale.startswith("en"):
-            return (
-                "Thank you for your message. Our staff will review your request "
-                "and get back to you shortly."
-            )
-        return (
-            "문의 주셔서 감사합니다. 담당자가 곧 확인 후 다시 안내드리겠습니다."
-        )
+            parts = [
+                f"[INTENT]: {req.intent}",
+                f"[PROPERTY_CODE]: {req.property_code or 'UNKNOWN'}",
+                "",
+                "[CONTEXT_JSON]:",
+                context_json,
+                "",
+                "[GUEST_MESSAGE]:",
+                req.guest_message.strip(),
+            ]
+            if req.template_body:
+                parts.extend(
+                    [
+                        "",
+                        "[TEMPLATE_HINT]:",
+                        "아래 템플릿은 참고용 예시입니다. 이 템플릿의 어조와 구조를 참고하되, "
+                        "위 CONTEXT_JSON에 맞지 않는 정보는 절대 사용하지 마세요.",
+                        req.template_body,
+                    ]
+                )
+        else:
+            parts = [
+                f"[INTENT]: {req.intent}",
+                f"[PROPERTY_CODE]: {req.property_code or 'UNKNOWN'}",
+                "",
+                "[CONTEXT_JSON]:",
+                context_json,
+                "",
+                "[GUEST_MESSAGE]:",
+                req.guest_message.strip(),
+            ]
+            if req.template_body:
+                parts.extend(
+                    [
+                        "",
+                        "[TEMPLATE_HINT]:",
+                        "The following template is a hint. Mimic its tone and structure, "
+                        "but do NOT include any information that is not present in CONTEXT_JSON.",
+                        req.template_body,
+                    ]
+                )
 
-    def _build_system_prompt_with_context(self, locale: str) -> str:
+        return "\n".join(parts)
+
+    # -------------------------------------------------- #
+
+    def _default_fallback_reply(self, *, locale: str) -> str:
         if locale.startswith("ko"):
             return (
-                "당신은 숙박업 전문 고객응대 어시스턴트입니다.\n"
-                "아래에서 제공되는 JSON 컨텍스트 안에 있는 정보만 사용해서 답변하세요.\n"
-                "- 컨텍스트에 없는 정보는 추측하거나 지어내지 마세요.\n"
-                "- 모르는 내용이 있으면 '제공된 정보 안에는 해당 내용이 없습니다. "
-                "호스트에게 확인해 드리겠습니다.'처럼 정직하게 답하세요.\n"
-                "- 게스트에게는 존댓말을 사용하고, 친절하지만 과도하게 가볍지 않은 톤으로 답변하세요.\n"
-                "- 정책(체크인 시간, 반려동물, 주차, 흡연 등)은 컨텍스트에 있는 문구를 "
-                "최대한 유지하되, 자연스럽게 풀어 설명하세요.\n"
-                "- 답변은 이메일/메시지 본문으로 바로 사용할 수 있게 완성된 문장만 작성하세요."
+                "문의 주셔서 감사합니다. 현재 문의주신 내용을 "
+                "담당자가 확인 후 다시 답변드리겠습니다."
             )
-
-        return (
-            "You are a hospitality support assistant.\n"
-            "You must answer STRICTLY based on the JSON context provided below.\n"
-            "- Do NOT invent policies or details that are not present in the context.\n"
-            "- If some information is missing, clearly say that it is not available in the context "
-            "and that you will check with the host.\n"
-            "- Use a polite, warm but professional tone.\n"
-            "- Write a final answer that can be sent to the guest as-is."
-        )
-
-    def _build_system_prompt_template_refine(self, locale: str) -> str:
-        if locale.startswith("ko"):
+        if locale.startswith("en"):
             return (
-                "당신은 숙박업 전문 고객응대 어시스턴트입니다.\n"
-                "아래 제공된 초안 템플릿을 기반으로 게스트 메시지에 맞게 자연스럽게 다듬어 주세요.\n"
-                "- 정책의 의미는 바꾸지 말고, 문장을 더 이해하기 쉽게 조정하세요.\n"
-                "- 존댓말, 친절하지만 지나치게 가볍지 않은 톤을 유지하세요."
+                "Thank you for your message. Based on the current system information, "
+                "a precise answer is difficult, so a staff member will review your request "
+                "and get back to you."
             )
-
         return (
-            "You are a hospitality support assistant.\n"
-            "Based on the draft reply template and the guest message, "
-            "rewrite the reply so that it is clear, polite and professional.\n"
-            "Keep the original policy meaning."
+            "문의 주셔서 감사합니다. 담당자가 확인 후 다시 안내드리겠습니다."
         )
 
 
-@lru_cache()
+# ------------------------------------------------------ #
+# 모듈 레벨 싱글톤 헬퍼
+# ------------------------------------------------------ #
+
+_llm_client_singleton: LLMClient | None = None
+
+
 def get_llm_client() -> LLMClient:
-    api_key = getattr(settings, "LLM_API_KEY", None)
-    model = getattr(settings, "LLM_MODEL", "gpt-4.1-mini")
-    return LLMClient(api_key=api_key, model=model)
+    """
+    settings 기반 LLMClient 싱글톤 생성.
+    """
+    global _llm_client_singleton
+    if _llm_client_singleton is None:
+        api_key = getattr(settings, "LLM_API_KEY", None)
+        model = getattr(settings, "LLM_MODEL", None)
+        _llm_client_singleton = LLMClient(api_key=api_key, model=model)
+    return _llm_client_singleton

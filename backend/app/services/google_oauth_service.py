@@ -43,6 +43,7 @@ def build_google_auth_url() -> str:
                 "https://www.googleapis.com/auth/userinfo.profile",
                 "https://www.googleapis.com/auth/gmail.readonly",
                 "https://www.googleapis.com/auth/gmail.modify",
+                "https://www.googleapis.com/auth/gmail.send",
             ]
         ),
         "include_granted_scopes": "true",

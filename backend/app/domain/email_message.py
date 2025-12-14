@@ -2,8 +2,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from .intents import Intent
-
+from app.domain.intents import MessageIntent
+from typing import Any
 
 @dataclass
 class IncomingMessage:
@@ -26,7 +26,7 @@ class ClassificationResult:
     인텐트 분류 + 답변 정책까지 적용된 결과.
     """
 
-    intent: Intent
+    intent: MessageIntent
     confidence: float
     auto_reply: bool
     need_human: bool

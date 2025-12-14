@@ -1,166 +1,229 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+from sqlalchemy import select, asc
+from sqlalchemy.orm import Session
 
-from app.domain.intents import MessageIntent
-from app.domain.models.incoming_message import IncomingMessage
-from app.domain.models.property_profile import PropertyProfile
+from app.domain.intents import MessageIntent, FineGrainedIntent
 from app.repositories.property_profile_repository import PropertyProfileRepository
+from app.repositories.messages import IncomingMessageRepository
+from app.domain.models.incoming_message import IncomingMessage
+from app.domain.models.conversation import Conversation
 
 
-@dataclass
+@dataclass(slots=True)
 class ReplyContext:
     """
-    LLM에 전달할 컨텍스트 DTO.
-
-    - property: 숙소 관련 지식
-    - message: 게스트 메시지 및 메일 메타 정보
-    - intent: TONO 분류 Intent 정보
+    LLM AutoReply 프롬프트에 들어갈 컨텍스트 구조체.
     """
 
-    property: dict[str, Any] | None
-    message: dict[str, Any]
-    intent: dict[str, Any]
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    message_id: int
+    locale: str
+    ota: Optional[str]
+    property_code: Optional[str]
+    primary_intent: MessageIntent
+    fine_intent: Optional[FineGrainedIntent]
+    pure_guest_message: str
+    property_profile: Optional[Dict[str, Any]]
 
 
 class ReplyContextBuilder:
     """
-    IncomingMessage + MessageIntent + property_code를 받아
-    LLM 컨텍스트(JSON)를 구성하는 역할만 담당.
+    Message + PropertyProfile + Intent를 묶어 LLM에 넘길 컨텍스트를 만든다.
     """
 
-    def __init__(self, property_repo: PropertyProfileRepository):
-        self.property_repo = property_repo
-
-    # --- public API ---
+    def __init__(self, db: Session) -> None:
+        self._db = db
+        self._msg_repo = IncomingMessageRepository(db)
+        self._property_repo = PropertyProfileRepository(db)
 
     def build_for_message(
         self,
         *,
-        message: IncomingMessage,
-        intent: MessageIntent | None,
-        property_code: str | None,
+        message_id: int,
+        primary_intent: MessageIntent,
+        fine_intent: Optional[FineGrainedIntent],
+        locale: str,
+        explicit_property_code: Optional[str] = None,
     ) -> ReplyContext:
-        """
-        - property_code 기준으로 PropertyProfile 조회
-        - Intent 종류에 맞게 필요한 필드만 추출
-        - message / intent 관련 메타 포함
-        """
+        msg = self._msg_repo.get_by_id(message_id)
 
-        profile: PropertyProfile | None = None
+        if not msg:
+            raise ValueError(f"IncomingMessage(id={message_id}) not found")
+
+        property_code = explicit_property_code or msg.property_code
+
+        property_profile_dict: Optional[Dict[str, Any]] = None
         if property_code:
-            profile = self.property_repo.get_by_property_code(property_code)
+            profile = self._property_repo.get_by_property_code(property_code)
+            if profile:
+                property_profile_dict = self._select_fields_by_intent(
+                    profile=profile,
+                    primary_intent=primary_intent,
+                    fine_intent=fine_intent,
+                )
 
-        property_ctx = (
-            self._build_property_context(profile=profile, intent=intent)
-            if profile
-            else None
-        )
-        message_ctx = self._build_message_context(message=message)
-        intent_ctx = self._build_intent_context(intent=intent)
+        pure_guest_message = msg.pure_guest_message or ""
 
         return ReplyContext(
-            property=property_ctx,
-            message=message_ctx,
-            intent=intent_ctx,
+            message_id=msg.id,
+            locale=locale,
+            ota=msg.ota,
+            property_code=property_code,
+            primary_intent=primary_intent,
+            fine_intent=fine_intent,
+            pure_guest_message=pure_guest_message,
+            property_profile=property_profile_dict,
         )
 
-    # --- 내부 헬퍼들 ---
-
-    def _build_property_context(
+    def build_for_conversation(
         self,
         *,
-        profile: PropertyProfile,
-        intent: MessageIntent | None,
-    ) -> dict[str, Any]:
-        base = {
-            "property_code": profile.property_code,
+        thread_id: str,
+        primary_intent: MessageIntent,
+        fine_intent: Optional[FineGrainedIntent],
+        locale: str,
+        explicit_property_code: Optional[str] = None,
+        max_messages: int = 20,
+    ) -> ReplyContext:
+        msgs = (
+            self._db.execute(
+                select(IncomingMessage)
+                .where(IncomingMessage.thread_id == thread_id)
+                .order_by(asc(IncomingMessage.received_at), asc(IncomingMessage.id))
+            )
+            .scalars()
+            .all()
+        )
+        if not msgs:
+            raise ValueError(f"No messages for thread_id={thread_id}")
+
+        msgs = msgs[-max_messages:]
+
+        transcript_lines: list[str] = []
+        last_guest: Optional[IncomingMessage] = None
+
+        for m in msgs:
+            text = (m.pure_guest_message or m.content or "").strip()
+            if not text:
+                continue
+
+            direction = getattr(m.direction, "value", None) or str(getattr(m, "direction", "incoming"))
+            direction = direction.split(".")[-1]
+            speaker = "게스트" if direction == "incoming" else "호스트"
+            transcript_lines.append(f"{speaker}: {text}")
+
+            if direction == "incoming":
+                last_guest = m
+
+        if not last_guest:
+            raise ValueError("No guest(incoming) message found in thread")
+
+        conversation_text = "\n".join(transcript_lines).strip()
+        if not conversation_text:
+            raise ValueError("Conversation transcript is empty")
+
+        # ✅ 기존 build_for_message 로직 재사용(중요: Intent import 문제/타입 문제 방지)
+        base = self.build_for_message(
+            message_id=last_guest.id,
+            primary_intent=primary_intent,
+            fine_intent=fine_intent,
+            locale=locale,
+            explicit_property_code=explicit_property_code,
+        )
+
+        # ✅ 차이는 pure_guest_message에 transcript 넣는 것뿐
+        return ReplyContext(
+            message_id=base.message_id,
+            locale=base.locale,
+            ota=base.ota,
+            property_code=base.property_code,
+            primary_intent=base.primary_intent,
+            fine_intent=base.fine_intent,
+            pure_guest_message=conversation_text,
+            property_profile=base.property_profile,
+        )
+    # ------------------------------------------------------------------
+    # 내부: Intent에 따라 PropertyProfile에서 어떤 필드를 꺼낼지 결정
+    # ------------------------------------------------------------------
+
+    def _select_fields_by_intent(
+        self,
+        *,
+        profile: Any,  # SQLAlchemy 모델
+        primary_intent: MessageIntent,
+        fine_intent: Optional[FineGrainedIntent],
+    ) -> Dict[str, Any]:
+        """
+        LLM이 쓰게 할 필드만 골라서 dict로 만들어 준다.
+        (PropertyProfile 전체를 던지지 않고, Intent에 맞는 부분만)
+        """
+
+        base: Dict[str, Any] = {
             "name": profile.name,
             "locale": profile.locale,
-        }
-
-        common = {
-            "checkin_from": profile.checkin_from,
-            "checkin_to": profile.checkin_to,
-            "checkout_until": profile.checkout_until,
-            "parking_info": profile.parking_info,
-            "pet_policy": profile.pet_policy,
-            "smoking_policy": profile.smoking_policy,
-            "noise_policy": profile.noise_policy,
-            "amenities": profile.amenities,
             "address_summary": profile.address_summary,
-            "location_guide": profile.location_guide,
-            "access_guide": profile.access_guide,
             "house_rules": profile.house_rules,
-            "space_overview": profile.space_overview,
             "extra_metadata": profile.extra_metadata,
         }
 
-        if intent is None:
-            # Intent 모르면 통째로 제공
-            return {**base, **common}
+        # 체크인 계열
+        if primary_intent == MessageIntent.CHECKIN_QUESTION:
+            base.update(
+                {
+                    "checkin_from": profile.checkin_from,
+                    #"checkin_to": profile.checkin_to,
+                    "access_guide": profile.access_guide,
+                    "parking_info": profile.parking_info,
+                }
+            )
 
-        name = intent.name
+        # 체크아웃 계열
+        if primary_intent == MessageIntent.CHECKOUT_QUESTION:
+            base.update(
+                {
+                    "checkout_until": profile.checkout_until,
+                    "access_guide": profile.access_guide,
+                }
+            )
 
-        if name == "CHECKIN_QUESTION":
-            fields = [
-                "checkin_from",
-                "checkin_to",
-                "checkout_until",
-                "access_guide",
-                "location_guide",
-                "house_rules",
-            ]
-        elif name == "PET_POLICY_QUESTION":
-            fields = ["pet_policy", "house_rules"]
-        elif name == "LOCATION_QUESTION":
-            fields = ["address_summary", "location_guide", "amenities"]
-        elif name == "AMENITY_QUESTION":
-            fields = ["amenities", "space_overview"]
-        else:
-            # GENERAL_QUESTION, OTHER 등
-            fields = [
-                "space_overview",
-                "amenities",
-                "parking_info",
-                "pet_policy",
-                "location_guide",
-                "house_rules",
-                "noise_policy",
-            ]
+        # 위치/주차 계열 (LOCATION_QUESTION 하나로 처리, 주차도 포함)
+        if primary_intent == MessageIntent.LOCATION_QUESTION:
+            base.update(
+                {
+                    "parking_info": profile.parking_info,
+                    "location_guide": profile.location_guide,
+                    "access_guide": profile.access_guide,
+                }
+            )
 
-        filtered = {k: v for k, v in common.items() if k in fields}
-        return {**base, **filtered}
+        # 편의시설 계열
+        if primary_intent == MessageIntent.AMENITY_QUESTION:
+            base.update(
+                {
+                    "amenities": profile.amenities,
+                    "space_overview": profile.space_overview,
+                }
+            )
 
-    def _build_message_context(self, *, message: IncomingMessage) -> dict[str, Any]:
-        return {
-            "id": message.id,
-            "gmail_message_id": message.gmail_message_id,
-            "thread_id": message.thread_id,
-            "subject": message.subject,
-            "from_email": message.from_email,
-            "received_at": (
-                message.received_at.isoformat() if message.received_at else None
-            ),
-            # V2 모델 기준으로 존재한다고 가정
-            "text_body": getattr(message, "text_body", None),
-            "html_body": getattr(message, "html_body", None),
-            "pure_guest_message": getattr(message, "pure_guest_message", None),
-            "sender_actor": message.sender_actor.name,
-            "actionability": message.actionability.name,
-        }
+        # 반려동물 정책
+        if primary_intent == MessageIntent.PET_POLICY_QUESTION:
+            base.update(
+                {
+                    "pet_policy": profile.pet_policy,
+                    "house_rules": profile.house_rules,
+                }
+            )
 
-    def _build_intent_context(self, *, intent: MessageIntent | None) -> dict[str, Any]:
-        if intent is None:
-            return {
-                "intent": None,
-                "description": None,
-            }
-        return {
-            "intent": intent.name,
-            "description": getattr(intent, "value", None),
-        }
+        # 하우스 룰 계열 (흡연/소음 등 FineIntent로 더 세밀히 가능)
+        if primary_intent == MessageIntent.HOUSE_RULE_QUESTION:
+            base.update(
+                {
+                    "smoking_policy": profile.smoking_policy,
+                    "noise_policy": profile.noise_policy,
+                    "house_rules": profile.house_rules,
+                }
+            )
+
+        return base

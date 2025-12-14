@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
-from sqlalchemy import String, Text, DateTime, Boolean, JSON
+from sqlalchemy import (
+    String,
+    Text,
+    Boolean,
+    DateTime,
+    Integer,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -11,76 +17,253 @@ from app.db.base import Base
 
 class PropertyProfile(Base):
     """
-    숙소별 지식 컨텍스트 모델.
+    숙소 지식 컨텍스트를 저장하는 모델.
 
-    - property_code 기준으로 고유 식별
-    - LLM 컨텍스트로 넘길 수 있는 모든 정형/반정형 정보를 저장
+    - property_code: TONO 내부 숙소 코드 (Airbnb listing 여러 개가 이 코드로 묶일 수 있음)
+    - name: 숙소/객실 이름
+    - locale: 기본 언어 (예: "ko-KR", "en-US")
     """
 
     __tablename__ = "property_profiles"
 
     id: Mapped[int] = mapped_column(
         primary_key=True,
-        index=True,
         autoincrement=True,
     )
 
-    # Airbnb listing ID 또는 내부 코드
     property_code: Mapped[str] = mapped_column(
         String(64),
         unique=True,
-        nullable=False,
         index=True,
+        nullable=False,
     )
 
-    # 숙소 이름
     name: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
     )
 
-    # 언어/로케일 (예: ko-KR, en-US)
     locale: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
         default="ko-KR",
-        index=True,
     )
 
-    # 체크인/체크아웃 시간 정보
-    checkin_from: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    checkin_to: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    checkout_until: Mapped[str | None] = mapped_column(String(32), nullable=True)
-
-    # 주차/반려동물/흡연/소음 정책
-    parking_info: Mapped[str | None] = mapped_column(Text, nullable=True)
-    pet_policy: Mapped[str | None] = mapped_column(Text, nullable=True)
-    smoking_policy: Mapped[str | None] = mapped_column(Text, nullable=True)
-    noise_policy: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # 편의시설 정보 (JSON)
-    # 예: {"wifi": true, "washer": true, "parking_spot_count": 2, ...}
-    amenities: Mapped[dict[str, Any] | None] = mapped_column(
-        JSON,
+    # ===== 체크인 / 체크아웃 시간 =====
+    # 예: "15:00", "12:00" 등의 문자열로 관리
+    checkin_from: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+    )
+    # checkin_to 컬럼은 DB에서 삭제했으므로 ORM에서도 제거
+    checkout_until: Mapped[str | None] = mapped_column(
+        String(16),
         nullable=True,
     )
 
-    # 주소/위치/이동 안내
+    # ===== 위치 / 주소 / 안내 =====
+    # 상세 주소
+    address_full: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    # 간단 요약 주소/위치 설명 (기존 필드)
     address_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     location_guide: Mapped[str | None] = mapped_column(Text, nullable=True)
     access_guide: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # 하우스룰, 공간 설명
-    house_rules: Mapped[str | None] = mapped_column(Text, nullable=True)
-    space_overview: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # 확장용 메타데이터(JSON)
-    # 예: {"tone": "친절하지만 단호하게", "forbidden_words": [...], ...}
-    extra_metadata: Mapped[dict[str, Any] | None] = mapped_column(
-        JSON,
+    # ===== 공간 / 구조 정보 =====
+    # 집 구조 설명 (예: "복층 구조 1층 침실 1개·화장실 2개, 2층 침실 1개·주방·테라스")
+    floor_plan: Mapped[str | None] = mapped_column(
+        Text,
         nullable=True,
     )
 
+    bedroom_count: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    bed_count: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    # 침대 타입 설명 (예: "퀸사이즈 침대 3개 (1층 1개, 2층 2개)")
+    bed_types: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    bathroom_count: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    has_elevator: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+
+    # 기준/최대 인원
+    capacity_base: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    capacity_max: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    has_terrace: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+
+    # ===== 체크인 방식 =====
+    # 예: DOORLOCK_SELF_CHECKIN, MEET_AND_GREET 등
+    checkin_method: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    # ===== 네트워크 / 기본 편의 =====
+    wifi_ssid: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+    )
+    wifi_password: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+    )
+
+    towel_count_provided: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    aircon_count: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    aircon_usage_guide: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    heating_usage_guide: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    # ===== 추가 침구 =====
+    extra_bedding_available: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    extra_bedding_price_info: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    # ===== 세탁 / 조리 =====
+    laundry_guide: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    has_washer: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    has_dryer: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+
+    cooking_allowed: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+
+    has_seasonings: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    has_tableware: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    has_rice_cooker: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+
+    # ===== 엔터테인먼트 =====
+    has_tv: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    has_projector: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    has_turntable: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    has_wine_opener: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+
+    # ===== 수영장 / 온수풀 / 바베큐 =====
+    has_pool: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    hot_pool_fee_info: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    bbq_available: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    bbq_guide: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    # ===== 정책/하우스 룰 =====
+    parking_info: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    pet_allowed: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    pet_policy: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    smoking_policy: Mapped[str | None] = mapped_column(Text, nullable=True)
+    noise_policy: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    house_rules: Mapped[str | None] = mapped_column(Text, nullable=True)
+    space_overview: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ===== 편의시설 JSON & 메타데이터 =====
+    amenities: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+
+    extra_metadata: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+
+    # ===== 공통 =====
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
@@ -101,7 +284,4 @@ class PropertyProfile(Base):
     )
 
     def __repr__(self) -> str:
-        return (
-            f"<PropertyProfile id={self.id} "
-            f"code={self.property_code} locale={self.locale} active={self.is_active}>"
-        )
+        return f"<PropertyProfile id={self.id} code={self.property_code} name={self.name}>"

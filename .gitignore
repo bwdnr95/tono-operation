@@ -46,3 +46,11 @@ docker-compose.override.yml
 
 # ---- Jupyter ----
 .ipynb_checkpoints/
+
+node_modules/
+dist/
+build/
+_scan/
+.venv/
+__pycache__/
+*.pyc

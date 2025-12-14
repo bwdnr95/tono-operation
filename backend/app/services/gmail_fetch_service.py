@@ -3,11 +3,10 @@ from googleapiclient.discovery import build
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.repositories.google_token_repository import get_google_token_by_email
-
+from app.repositories.google_token_repository import get_google_token
 
 def get_gmail_service(db: Session):
-    token = get_google_token_by_email(db, settings.GMAIL_USER)
+    token = get_google_token(db, settings.GMAIL_USER)
     if not token:
         raise RuntimeError("GoogleToken이 없습니다. 먼저 OAuth 연동을 진행하세요.")
 
@@ -20,6 +19,7 @@ def get_gmail_service(db: Session):
         scopes=[
             "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.send",
         ],
     )
 

@@ -1,3 +1,4 @@
+# backend/app/core/config.py
 import os
 from pathlib import Path
 
@@ -27,9 +28,10 @@ class Settings:
 
         # Gmail 계정
         self.GMAIL_USER: str = os.getenv("GMAIL_USER", "")
-      
-        # LLM 설정
-        LLM_API_KEY: str | None = None
-        LLM_MODEL: str = "gpt-4.1-mini"
+
+        # LLM 설정  🔥 여기 중요
+        self.LLM_API_KEY: str | None = os.getenv("LLM_API_KEY")
+        self.LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4.1-mini")
+
 
 settings = Settings()

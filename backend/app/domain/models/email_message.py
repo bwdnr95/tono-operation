@@ -14,7 +14,7 @@ class EmailMessage(Base):
     id = Column(Integer, primary_key=True, index=True)
 
     # Gmail 쪽 메타
-    gmail_message_id = Column(String(128), nullable=False)
+    gmail_message_id = Column(String(255), nullable=False)
     gmail_thread_id = Column(String(128), nullable=True)
 
     # 발신/제목/본문
