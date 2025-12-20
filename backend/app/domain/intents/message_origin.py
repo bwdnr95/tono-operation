@@ -6,19 +6,19 @@ from pydantic import BaseModel
 
 class MessageActor(StrEnum):
     """Airbnb 스레드 상에서 누가 말한 것인지 (주체)."""
-    GUEST = "guest"
-    HOST = "host"
-    SYSTEM = "system"   # Airbnb 시스템 알림, 마케팅 등
-    UNKNOWN = "unknown"
+    GUEST = "GUEST"
+    HOST = "HOST"
+    SYSTEM = "SYSTEM"
+    UNKNOWN = "UNKNOWN"
 
 
 class MessageActionability(StrEnum):
     """이 메일에 대해 TONO가 실제 답변/액션을 해야 하는지."""
-    NEEDS_REPLY = "needs_reply"          # 게스트 문의 등 → 답장 필요
-    OUTGOING_COPY = "outgoing_copy"      # 우리가 보낸 메시지의 사본 → 답장 불필요
-    SYSTEM_NOTIFICATION = "system_notification"  # 예약 확정, 취소 등 알림 → 자동응답 X, 내부 로직만
-    FYI = "fyi"                          # 단순 참고용
-    UNKNOWN = "unknown"
+    NEEDS_REPLY = "NEEDS_REPLY"
+    OUTGOING_COPY = "OUTGOING_COPY"
+    SYSTEM_NOTIFICATION = "SYSTEM_NOTIFICATION"
+    FYI = "FYI"
+    UNKNOWN = "UNKNOWN"
 
 
 class AirbnbMessageOriginResult(BaseModel):

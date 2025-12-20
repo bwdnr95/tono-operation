@@ -35,7 +35,7 @@ class GmailSendAdapter:
     def send_reply(
         self,
         *,
-        thread_id: str,
+        gmail_thread_id: str,
         to_email: str,
         subject: str,
         reply_text: str,
@@ -44,7 +44,7 @@ class GmailSendAdapter:
         """
         Gmail 스레드에 답장을 전송한다.
 
-        :param thread_id: Gmail threadId (Airbnb 대화 스레드)
+        :param gmail_thread_id: Gmail API threadId
         :param to_email: 게스트 이메일 주소
         :param subject: 원본 메일 제목 (자동으로 "Re: " prefix 붙음)
         :param reply_text: 평문 본문
@@ -75,7 +75,7 @@ class GmailSendAdapter:
 
         body = {
             "raw": raw_b64,
-            "threadId": thread_id,
+            "threadId": gmail_thread_id,
         }
 
         return (

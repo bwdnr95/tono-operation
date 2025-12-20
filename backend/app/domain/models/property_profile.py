@@ -263,6 +263,14 @@ class PropertyProfile(Base):
         nullable=True,
     )
 
+    # ===== FAQ 데이터 =====
+    # 구조: [{"key": "string", "category": "string", "answer": "string"}]
+    faq_entries: Mapped[list | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        default=list,
+    )
+
     # ===== 공통 =====
     is_active: Mapped[bool] = mapped_column(
         Boolean,

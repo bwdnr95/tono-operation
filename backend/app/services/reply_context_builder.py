@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from sqlalchemy import select, asc
 from sqlalchemy.orm import Session
 
 from app.domain.intents import MessageIntent, FineGrainedIntent
 from app.repositories.property_profile_repository import PropertyProfileRepository
 from app.repositories.messages import IncomingMessageRepository
+from app.repositories.reservation_info_repository import ReservationInfoRepository
+from app.repositories.commitment_repository import CommitmentRepository
 from app.domain.models.incoming_message import IncomingMessage
 from app.domain.models.conversation import Conversation
 
@@ -26,6 +28,12 @@ class ReplyContext:
     fine_intent: Optional[FineGrainedIntent]
     pure_guest_message: str
     property_profile: Optional[Dict[str, Any]]
+    
+    # 🔹 예약 정보 (reservation_info에서 가져옴)
+    reservation_context: Optional[str] = None  # LLM에게 전달할 문자열 형태
+    
+    # 🆕 Commitment 정보 (이전에 확정한 약속들)
+    commitment_context: Optional[str] = None  # LLM에게 전달할 문자열 형태
 
 
 class ReplyContextBuilder:
@@ -37,6 +45,8 @@ class ReplyContextBuilder:
         self._db = db
         self._msg_repo = IncomingMessageRepository(db)
         self._property_repo = PropertyProfileRepository(db)
+        self._reservation_repo = ReservationInfoRepository(db)
+        self._commitment_repo = CommitmentRepository(db)
 
     def build_for_message(
         self,
@@ -80,7 +90,7 @@ class ReplyContextBuilder:
     def build_for_conversation(
         self,
         *,
-        thread_id: str,
+        airbnb_thread_id: str,
         primary_intent: MessageIntent,
         fine_intent: Optional[FineGrainedIntent],
         locale: str,
@@ -90,14 +100,14 @@ class ReplyContextBuilder:
         msgs = (
             self._db.execute(
                 select(IncomingMessage)
-                .where(IncomingMessage.thread_id == thread_id)
+                .where(IncomingMessage.airbnb_thread_id == airbnb_thread_id)
                 .order_by(asc(IncomingMessage.received_at), asc(IncomingMessage.id))
             )
             .scalars()
             .all()
         )
         if not msgs:
-            raise ValueError(f"No messages for thread_id={thread_id}")
+            raise ValueError(f"No messages for airbnb_thread_id={airbnb_thread_id}")
 
         msgs = msgs[-max_messages:]
 
@@ -132,8 +142,23 @@ class ReplyContextBuilder:
             locale=locale,
             explicit_property_code=explicit_property_code,
         )
+        
+        # 🔹 reservation_info 조회 → LLM context 문자열 생성
+        reservation_context: Optional[str] = None
+        reservation_info = self._reservation_repo.get_by_airbnb_thread_id(airbnb_thread_id)
+        if reservation_info:
+            reservation_context = reservation_info.to_llm_context()
+        
+        # 🆕 commitment 조회 → LLM context 문자열 생성
+        commitment_context: Optional[str] = None
+        commitments = self._commitment_repo.get_active_by_thread_id(airbnb_thread_id)
+        if commitments:
+            lines = ["[이전에 확정한 약속들]"]
+            for c in commitments:
+                lines.append(f"- {c.to_llm_context()}")
+            commitment_context = "\n".join(lines)
 
-        # ✅ 차이는 pure_guest_message에 transcript 넣는 것뿐
+        # ✅ 차이는 pure_guest_message에 transcript 넣는 것 + reservation_context + commitment_context 추가
         return ReplyContext(
             message_id=base.message_id,
             locale=base.locale,
@@ -143,6 +168,8 @@ class ReplyContextBuilder:
             fine_intent=base.fine_intent,
             pure_guest_message=conversation_text,
             property_profile=base.property_profile,
+            reservation_context=reservation_context,
+            commitment_context=commitment_context,
         )
     # ------------------------------------------------------------------
     # 내부: Intent에 따라 PropertyProfile에서 어떤 필드를 꺼낼지 결정

@@ -4,76 +4,72 @@ from datetime import datetime
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
+from sqlalchemy import Enum
 
-
-ConversationStatus = Literal["open", "needs_review", "ready_to_send", "sent", "blocked"]
 SafetyStatus = Literal["pass", "review", "block"]
-Channel = Literal["gmail"]
 
 
 class ConversationListItemDTO(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: UUID
-    channel: Channel = "gmail"
-    thread_id: str
-    status: ConversationStatus
+    channel: str
+    airbnb_thread_id: str
+    property_code: Optional[str] = None  # 숙소 코드
+    status: str
     safety_status: SafetyStatus
-    last_message_id: Optional[int] = None
+    is_read: bool = False  # 읽음/안읽음 상태
+    last_message_id: Optional[int]
     updated_at: datetime
+    # 게스트 정보
+    guest_name: Optional[str] = None
+    checkin_date: Optional[str] = None
+    checkout_date: Optional[str] = None
 
 
-class ConversationDTO(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: UUID
-    channel: Channel = "gmail"
-    thread_id: str
-    status: ConversationStatus
-    safety_status: SafetyStatus
-    last_message_id: Optional[int] = None
+class ConversationDTO(ConversationListItemDTO):
     created_at: datetime
-    updated_at: datetime
 
 
 class ConversationMessageDTO(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: int
-    thread_id: str
-    direction: Literal["incoming", "outgoing"]
-    sender_actor: Literal["GUEST", "HOST", "SYSTEM", "UNKNOWN"]
-    subject: Optional[str] = None
-    from_email: Optional[str] = None
-    received_at: datetime
-    pure_guest_message: Optional[str] = None
-    content: Optional[str] = None
-    intent: Optional[str] = None
-    intent_confidence: Optional[float] = None
+    airbnb_thread_id: str
+    direction: str
+    content: str
+    created_at: datetime
+    guest_name: Optional[str] = None
+    checkin_date: Optional[str] = None
+    checkout_date: Optional[str] = None
 
 
 class DraftReplyDTO(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: UUID
     conversation_id: UUID
-    thread_id: str
+    airbnb_thread_id: str
     content: str
     safety_status: SafetyStatus
     created_at: datetime
     updated_at: datetime
 
 
+class SendActionLogDTO(BaseModel):
+    id: UUID
+    conversation_id: UUID
+    airbnb_thread_id: str
+    message_id: Optional[int]
+    action: str
+    created_at: datetime
+
+
 class ConversationDetailResponse(BaseModel):
     conversation: ConversationDTO
     messages: List[ConversationMessageDTO]
-    draft_reply: Optional[DraftReplyDTO] = None
+    draft_reply: Optional[DraftReplyDTO]
+    send_logs: List[SendActionLogDTO]
 
 
 class ConversationListResponse(BaseModel):
     items: List[ConversationListItemDTO]
-    next_cursor: Optional[str] = None
+    next_cursor: Optional[str]
 
 
 class DraftGenerateRequest(BaseModel):
@@ -82,24 +78,16 @@ class DraftGenerateRequest(BaseModel):
 
 class DraftPatchRequest(BaseModel):
     content: str
-
+class DraftAction(str, Enum):
+    send = "send"
+    bulk_send = "bulk_send"
 
 class DraftGenerateResponse(BaseModel):
     draft_reply: DraftReplyDTO
 
 
-class SendPreviewResponse(BaseModel):
-    conversation_id: UUID
-    draft_reply_id: UUID
-    safety_status: SafetyStatus
-    can_send: bool
-    preview_content: str
-    confirm_token: str
-
-
 class SendRequest(BaseModel):
     draft_reply_id: UUID
-    confirm_token: str
 
 
 class SendResponse(BaseModel):

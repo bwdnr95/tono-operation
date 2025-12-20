@@ -1,48 +1,56 @@
 // src/components/conversations/ConversationDetail.tsx
 import React from "react";
-import type { ConversationDetailDTO, SendPreviewDTO, SafetyStatus, MessageDirection } from "../../types/conversations";
+import type { ConversationDetailDTO, ThreadMessageDTO } from "../../types/conversations";
+import type { RiskSignalDTO, ConflictDTO } from "../../types/commitments";
+import { RiskSignalAlert, ConflictConfirmModal } from "./RiskSignalAlert";
+import { OutcomeLabelCard, SafetyBadge } from "./OutcomeLabelDisplay";
 
-function fmt(v: string) {
+function formatTime(v: string) {
   try {
-    return new Date(v).toLocaleString("ko-KR");
+    return new Date(v).toLocaleString("ko-KR", {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   } catch {
     return v;
   }
 }
 
-function safetyPill(s: SafetyStatus) {
-  if (s === "pass") return <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200">pass</span>;
-  if (s === "review") return <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-200">review</span>;
-  return <span className="rounded-full bg-rose-500/15 px-2 py-0.5 text-[10px] font-semibold text-rose-200">block</span>;
+function formatDate(v: string | null | undefined) {
+  if (!v) return null;
+  try {
+    return new Date(v).toLocaleDateString("ko-KR", { month: "short", day: "numeric" });
+  } catch {
+    return v;
+  }
 }
 
-function dirPill(d: MessageDirection) {
-  if (d === "incoming") return <span className="rounded-full bg-sky-500/15 px-2 py-0.5 text-[10px] font-semibold text-sky-200">incoming</span>;
-  return <span className="rounded-full bg-slate-500/15 px-2 py-0.5 text-[10px] font-semibold text-slate-200">outgoing</span>;
-}
-
-export function ConversationDetail(props: {
+interface Props {
   detail: ConversationDetailDTO | null;
   loading: boolean;
   error: string | null;
-
   draftContent: string;
   onChangeDraftContent: (v: string) => void;
-
   onGenerateDraft: () => void | Promise<void>;
   onSaveDraft: () => void | Promise<void>;
-
-  sendPreview: SendPreviewDTO | null;
-  onPreviewSend: () => void | Promise<void>;
   onSend: () => void | Promise<void>;
-
   generating: boolean;
   saving: boolean;
-  previewing: boolean;
   sending: boolean;
-
   lastActionMsg: string | null;
-}) {
+  onMarkRead?: () => void | Promise<void>;
+  riskSignals?: RiskSignalDTO[];
+  riskSignalsLoading?: boolean;
+  onDismissRiskSignal?: (signalId: string) => void;
+  conflicts?: ConflictDTO[];
+  showConflictModal?: boolean;
+  onConfirmSendWithConflict?: () => void;
+  onCancelSendWithConflict?: () => void;
+}
+
+export function ConversationDetail(props: Props) {
   const {
     detail,
     loading,
@@ -51,183 +59,205 @@ export function ConversationDetail(props: {
     onChangeDraftContent,
     onGenerateDraft,
     onSaveDraft,
-    sendPreview,
-    onPreviewSend,
     onSend,
     generating,
     saving,
-    previewing,
     sending,
     lastActionMsg,
+    onMarkRead,
+    riskSignals = [],
+    riskSignalsLoading = false,
+    onDismissRiskSignal,
+    conflicts = [],
+    showConflictModal = false,
+    onConfirmSendWithConflict,
+    onCancelSendWithConflict,
   } = props;
 
-  if (loading) return <div className="p-4 text-xs text-slate-400">상세 로딩 중...</div>;
+  const messagesEndRef = React.useRef<HTMLDivElement>(null);
+  const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+
+  React.useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [detail?.messages]);
+
+  React.useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+      textareaRef.current.style.height = textareaRef.current.scrollHeight + "px";
+    }
+  }, [draftContent]);
+
+  if (loading) {
+    return (
+      <div className="empty-state" style={{ flex: 1 }}>
+        <div className="loading-spinner" />
+      </div>
+    );
+  }
+
   if (!detail) {
     return (
-      <div className="flex h-full items-center justify-center p-6 text-xs text-slate-500">
-        좌측에서 thread Conversation을 선택하세요.
+      <div className="empty-state" style={{ flex: 1 }}>
+        <div className="empty-state-icon">💬</div>
+        <div className="empty-state-title">대화를 선택해주세요</div>
+        <div className="empty-state-text">왼쪽 목록에서 대화를 선택하면 상세 내용이 표시됩니다</div>
       </div>
     );
   }
 
   const c = detail.conversation;
   const draft = detail.draft_reply;
+  const messages = detail.messages || [];
 
-  const canPreview = !!draft && c.thread_id && c.channel === "gmail";
+  // 발송 조건: draft 존재 + thread_id 일치 + safety가 block이 아님 + status가 ready_to_send 또는 blocked(재시도)
   const canSend =
-    !!sendPreview &&
-    sendPreview.can_send === true &&
-    sendPreview.safety_status === "pass" &&
-    c.status === "ready_to_send" &&
-    sendPreview.thread_id === c.thread_id;
+    !!draft?.id &&
+    !!draft.airbnb_thread_id &&
+    draft.airbnb_thread_id === c.airbnb_thread_id &&
+    draft.safety_status !== "block" &&
+    (c.status === "ready_to_send" || c.status === "blocked");
+
+  // Guest info from conversation (reservation_info 기반)
+  const guestName = c.guest_name;
+  const checkinDate = c.checkin_date;
+  const checkoutDate = c.checkout_date;
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto p-4 md:p-5">
-      {/* Meta */}
-      <section className="rounded-xl border border-slate-800 bg-slate-950/80 px-4 py-3">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="text-sm font-semibold text-slate-100">
-              Conversation (thread canonical){" "}
-              <span className="ml-2 font-mono text-[12px] text-slate-400">{c.id}</span>
-            </div>
-            <div className="mt-1 text-[11px] text-slate-500">
-              channel: <span className="font-mono">{c.channel}</span> · thread_id:{" "}
-              <span className="font-mono">{c.thread_id}</span>
-            </div>
-
-            <div className="mt-2 flex flex-wrap items-center gap-2">
-              <span className="rounded-full bg-slate-700/30 px-2 py-0.5 text-[10px] font-semibold text-slate-300">
-                status: {c.status}
-              </span>
-              <span className="rounded-full bg-slate-700/30 px-2 py-0.5 text-[10px] font-semibold text-slate-300">
-                safety: {c.safety_status} {safetyPill(c.safety_status)}
-              </span>
-              <span className="rounded-full bg-slate-700/30 px-2 py-0.5 text-[10px] font-semibold text-slate-300">
-                last_message_id: <span className="font-mono">{c.last_message_id ?? "null"}</span>
-              </span>
-            </div>
-          </div>
-
-          <div className="text-right text-[11px] text-slate-500">
-            <div>created: {fmt(c.created_at)}</div>
-            <div>updated: {fmt(c.updated_at)}</div>
-          </div>
-        </div>
-
-        <div className="mt-3 rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
-          <div className="mb-1 text-[10px] font-semibold text-slate-400">thread_id invariant</div>
-          <div className="text-[11px] text-slate-400">
-            Outgoing 응답은 반드시 동일 thread_id로 귀속되어야 합니다. (thread_id 누락 시 발송 금지)
-          </div>
-        </div>
-      </section>
-
-      {/* Messages */}
-      <section className="rounded-xl border border-slate-800 bg-slate-950/80 px-4 py-3">
-        <h2 className="text-xs font-semibold text-slate-300">thread messages</h2>
-
-        <div className="mt-3 space-y-2">
-          {detail.messages?.length ? (
-            detail.messages.map((m) => (
-              <div key={m.id} className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
-                <div className="flex items-center justify-between gap-2 text-[10px] text-slate-500">
-                  <div className="flex items-center gap-2">
-                    {dirPill(m.direction)}
-                    <span className="font-mono">msg_id: {m.id}</span>
-                    <span className="font-mono">thread: {m.thread_id}</span>
-                  </div>
-                  <span>{fmt(m.created_at)}</span>
-                </div>
-                <div className="mt-1 whitespace-pre-wrap text-[12px] text-slate-100">{m.content}</div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      {/* Header */}
+      <div className="card-header" style={{ borderBottom: "1px solid var(--border)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          {guestName ? (
+            <>
+              <div className="conversation-avatar" style={{ width: "36px", height: "36px", fontSize: "13px" }}>
+                {guestName.charAt(0) || "G"}
               </div>
-            ))
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span style={{ fontWeight: 600 }}>{guestName}</span>
+                  {c.property_code && (
+                    <span className="badge badge-primary" style={{ padding: "2px 8px", fontSize: "10px" }}>
+                      {c.property_code}
+                    </span>
+                  )}
+                </div>
+                {checkinDate && checkoutDate && (
+                  <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+                    {formatDate(checkinDate)} → {formatDate(checkoutDate)}
+                  </div>
+                )}
+              </div>
+            </>
           ) : (
-            <div className="text-[11px] text-slate-500">메시지가 없습니다.</div>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <span style={{ fontWeight: 600 }}>게스트</span>
+              {c.property_code && (
+                <span className="badge badge-primary" style={{ padding: "2px 8px", fontSize: "10px" }}>
+                  {c.property_code}
+                </span>
+              )}
+            </div>
           )}
         </div>
-      </section>
-
-      {/* Draft */}
-      <section className="space-y-3 rounded-xl border border-slate-800 bg-slate-950/80 px-4 py-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-xs font-semibold text-slate-300">draft (thread 귀속 필수)</h2>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={onGenerateDraft}
-              disabled={generating}
-              className="rounded-full border border-slate-700 bg-slate-950 px-3 py-1.5 text-[11px] font-semibold text-sky-200 hover:bg-sky-500/10 disabled:opacity-60"
-            >
-              {generating ? "생성 중..." : "초안 생성 (LLM)"}
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <span className={`badge ${c.status === "ready_to_send" ? "badge-success" : c.status === "needs_review" ? "badge-warning" : c.status === "blocked" ? "badge-danger" : "badge-default"}`}>
+            {c.status === "ready_to_send" ? "발송준비" : c.status === "needs_review" ? "검토필요" : c.status === "sent" ? "완료" : c.status === "blocked" ? "실패" : "대기"}
+          </span>
+          <span className={`badge ${c.safety_status === "pass" ? "badge-success" : c.safety_status === "review" ? "badge-warning" : "badge-danger"}`}>
+            {c.safety_status === "pass" ? "안전" : c.safety_status === "review" ? "검토" : "차단"}
+          </span>
+          {onMarkRead && (
+            <button onClick={onMarkRead} className="btn btn-ghost btn-sm">
+              처리완료
             </button>
-            <button
-              type="button"
-              onClick={onSaveDraft}
-              disabled={saving || !draftContent.trim()}
-              className="rounded-full border border-slate-700 bg-slate-950 px-3 py-1.5 text-[11px] font-semibold text-amber-200 hover:bg-amber-500/10 disabled:opacity-60"
-            >
-              {saving ? "저장 중..." : "초안 저장"}
-            </button>
-          </div>
+          )}
         </div>
+      </div>
 
-        <div className="text-[11px] text-slate-500">
-          draft_id: <span className="font-mono text-slate-300">{draft?.id ?? "(null)"}</span>{" "}
-          · thread_id: <span className="font-mono text-slate-300">{draft?.thread_id ?? "(null)"}</span>{" "}
-          · safety: <span className="font-mono text-slate-300">{draft?.safety_status ?? "(null)"}</span>
-        </div>
-
-        <textarea
-          value={draftContent}
-          onChange={(e) => onChangeDraftContent(e.target.value)}
-          placeholder="thread 컨텍스트 기반 초안"
-          className="min-h-[160px] w-full resize-y rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-600 focus:border-slate-700"
-        />
-
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <button
-            type="button"
-            onClick={onPreviewSend}
-            disabled={previewing || !canPreview}
-            className="rounded-full bg-amber-500 px-3 py-1.5 text-[11px] font-semibold text-slate-950 hover:bg-amber-400 disabled:opacity-60"
-            title={!canPreview ? "draft + thread_id 필요" : ""}
-          >
-            {previewing ? "Preview 중..." : "Send Preview"}
-          </button>
-
-          <button
-            type="button"
-            onClick={onSend}
-            disabled={sending || !canSend}
-            className="rounded-full bg-sky-500 px-3 py-1.5 text-[11px] font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-60"
-            title={!canSend ? "confirm_token + thread_id match + can_send 필요" : ""}
-          >
-            {sending ? "발송 중..." : "확인 후 발송"}
-          </button>
-        </div>
-
-        {sendPreview ? (
-          <div className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
-            <div className="mb-1 flex items-center justify-between">
-              <div className="text-[10px] font-semibold text-slate-400">send:preview</div>
-              {safetyPill(sendPreview.safety_status)}
+      {/* Messages */}
+      <div className="message-list" style={{ flex: 1, background: "var(--bg)" }}>
+        {messages.length > 0 ? (
+          messages.map((m, idx) => (
+            <div key={m.id} className={`message ${m.direction === "incoming" ? "incoming" : "outgoing"}`}>
+              <div className="message-bubble">
+                {m.content}
+              </div>
+              <div className="message-time">{formatTime(m.created_at)}</div>
             </div>
-            <div className="text-[11px] text-slate-400 font-mono">
-              thread_id: {sendPreview.thread_id} · draft_reply_id: {sendPreview.draft_reply_id} · can_send:{" "}
-              {String(sendPreview.can_send)} · token: {sendPreview.confirm_token.slice(0, 10)}...
-            </div>
-            <div className="mt-2 whitespace-pre-wrap text-[12px] text-slate-100">
-              {sendPreview.preview_content}
-            </div>
-          </div>
+          ))
         ) : (
-          <div className="text-[11px] text-slate-500">Send Preview 실행 시 confirm_token이 발급됩니다.</div>
+          <div className="empty-state">
+            <div className="empty-state-text">메시지가 없습니다</div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Composer */}
+      <div className="composer">
+        {/* Risk Signals */}
+        {(riskSignals.length > 0 || riskSignalsLoading) && (
+          <div style={{ marginBottom: "12px" }}>
+            <RiskSignalAlert signals={riskSignals} loading={riskSignalsLoading} onDismiss={onDismissRiskSignal} />
+          </div>
         )}
 
-        {error ? <div className="text-[11px] text-rose-300">{error}</div> : null}
-        {lastActionMsg ? <div className="text-[11px] text-slate-400">{lastActionMsg}</div> : null}
-      </section>
+        {/* Outcome Label */}
+        {draft?.outcome_label && (
+          <div style={{ marginBottom: "12px" }}>
+            <OutcomeLabelCard outcomeLabel={draft.outcome_label} humanOverride={draft.human_override} />
+          </div>
+        )}
+
+        {/* Actions */}
+        <div className="composer-actions">
+          <button onClick={onGenerateDraft} disabled={generating} className="btn btn-secondary btn-sm">
+            {generating ? "생성 중..." : "🤖 AI 초안 생성"}
+          </button>
+          <button onClick={onSaveDraft} disabled={saving || !draftContent.trim()} className="btn btn-secondary btn-sm">
+            {saving ? "저장 중..." : "💾 저장"}
+          </button>
+          {lastActionMsg && (
+            <span style={{ fontSize: "12px", color: "var(--success)", marginLeft: "8px" }}>
+              ✓ {lastActionMsg}
+            </span>
+          )}
+        </div>
+
+        {/* Textarea + Send */}
+        <div className="composer-input">
+          <textarea
+            ref={textareaRef}
+            value={draftContent}
+            onChange={(e) => onChangeDraftContent(e.target.value)}
+            placeholder="답장을 입력하세요..."
+            className="composer-textarea"
+          />
+          <button
+            onClick={onSend}
+            disabled={sending || !canSend}
+            className="btn btn-primary composer-send"
+            title={!canSend ? "발송 조건: safety pass, status ready_to_send" : ""}
+          >
+            {sending ? "발송 중..." : "발송 →"}
+          </button>
+        </div>
+
+        {error && (
+          <div style={{ marginTop: "12px", padding: "12px", background: "rgba(239,68,68,0.1)", borderRadius: "var(--radius)", color: "var(--danger)", fontSize: "13px" }}>
+            {error}
+          </div>
+        )}
+      </div>
+
+      {/* Conflict Modal */}
+      <ConflictConfirmModal
+        isOpen={showConflictModal}
+        conflicts={conflicts}
+        onConfirm={onConfirmSendWithConflict || (() => {})}
+        onCancel={onCancelSendWithConflict || (() => {})}
+      />
     </div>
   );
 }

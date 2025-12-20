@@ -13,10 +13,11 @@ from sqlalchemy import (
     Float,
     Boolean,
     JSON,
+    Enum as SQLEnum,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base  # 프로젝트에 맞게 Base import 경로가 다르면 기존 경로 유지
+from app.db.base import Base
 
 
 class MessageDirection(str, Enum):
@@ -24,11 +25,9 @@ class MessageDirection(str, Enum):
     outgoing = "outgoing"
 
 
-class SenderActor(str, Enum):
-    GUEST = "GUEST"
-    HOST = "HOST"
-    SYSTEM = "SYSTEM"
-    UNKNOWN = "UNKNOWN"
+# MessageActor는 app.domain.intents.message_origin에서 import
+from app.domain.intents.message_origin import MessageActor, MessageActionability
+from app.domain.intents.types import MessageIntent
 
 
 class IncomingMessage(Base):
@@ -43,19 +42,27 @@ class IncomingMessage(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
     gmail_message_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    thread_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    gmail_thread_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)  # Gmail API threadId
+    airbnb_thread_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
 
     subject: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     from_email: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    reply_to: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # Reply-To 헤더
 
     received_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     pure_guest_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    sender_actor: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    actionability: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    sender_actor: Mapped[Optional[MessageActor]] = mapped_column(
+        SQLEnum(MessageActor, native_enum=False, length=32), nullable=True
+    )
+    actionability: Mapped[Optional[MessageActionability]] = mapped_column(
+        SQLEnum(MessageActionability, native_enum=False, length=32), nullable=True
+    )
 
     # ✅ 반드시 존재해야 함 (유저가 올린 컬럼 목록에 있음)
-    intent: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    intent: Mapped[Optional[MessageIntent]] = mapped_column(
+        SQLEnum(MessageIntent, native_enum=False, length=32), nullable=True
+    )
     intent_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     ota: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -77,12 +84,18 @@ class IncomingMessage(Base):
     checkout_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
     # ✅ direction/content (유저 컬럼 목록에 있음)
-    direction: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    direction: Mapped[Optional[MessageDirection]] = mapped_column(
+        SQLEnum(MessageDirection, native_enum=False, length=16), nullable=True
+    )
     content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # ✅ has_attachment / is_system_generated (유저 컬럼 목록에 있음)
     has_attachment: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     is_system_generated: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
 
-    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=datetime.now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=datetime.now, onupdate=datetime.now
+    )

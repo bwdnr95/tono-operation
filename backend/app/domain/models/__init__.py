@@ -10,9 +10,11 @@ from .auto_reply_template import AutoReplyTemplate
 from .auto_reply_recommendation import AutoReplyRecommendation
 from .staff_notification_record import StaffNotificationRecord
 from .staff_notification import StaffNotification
+from .reservation_info import ReservationInfo, ReservationStatus
+from .alteration_request import AlterationRequest, AlterationStatus
 
 # v1.3 THREAD-BASED Conversation models
-from .conversation import Conversation, DraftReply, SendActionLog, BulkSendJob
+from .conversation import Conversation, DraftReply, SendActionLog
 
 __all__ = [
     "Base",
@@ -24,8 +26,11 @@ __all__ = [
     "AutoReplyRecommendation",
     "StaffNotificationRecord",
     "StaffNotification",
+    "ReservationInfo",
+    "ReservationStatus",
+    "AlterationRequest",
+    "AlterationStatus",
     "Conversation",
     "DraftReply",
     "SendActionLog",
-    "BulkSendJob",
 ]

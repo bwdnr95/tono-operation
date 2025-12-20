@@ -93,23 +93,7 @@ def _last_non_empty_block(text: str) -> Optional[str]:
 
 
 def _extract_after_profile_block(lines: list[str]) -> Optional[str]:
-    """
-    프로필 블록(가입 연도 / 예약자) 바로 뒤의 문단을 게스트 메시지로 추출.
 
-    문의 메일:
-      Jeju-si, South Korea
-      에어비앤비 가입 연도: 2024
-
-      안녕하세요
-      체크인 몇 시부터 가능한가요?
-      얼리체크인도 가능한가요?
-
-    예약 확정 메일:
-      Tarshay
-      예약자
-
-      안녕하세요! 오후 10시에 제주에 도착할 예정이며 ...
-    """
     base_idx: int | None = None
 
     # 1순위: "가입 연도"

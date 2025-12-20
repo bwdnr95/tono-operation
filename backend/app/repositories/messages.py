@@ -7,7 +7,7 @@ from typing import Iterable, Sequence
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.domain.models.incoming_message import IncomingMessage
+from app.domain.models.incoming_message import IncomingMessage, MessageDirection
 from app.domain.intents import (
     MessageActor,
     MessageActionability,
@@ -53,6 +53,23 @@ class IncomingMessageRepository:
         result = self.session.execute(stmt).scalar_one_or_none()
         return result
 
+    def get_existing_gmail_message_ids(
+        self,
+        gmail_message_ids: list[str],
+    ) -> set[str]:
+        """
+        주어진 gmail_message_id 목록 중 이미 DB에 존재하는 ID들을 반환.
+        Gmail API 호출 최적화를 위해 사용.
+        """
+        if not gmail_message_ids:
+            return set()
+        
+        stmt = select(IncomingMessage.gmail_message_id).where(
+            IncomingMessage.gmail_message_id.in_(gmail_message_ids)
+        )
+        result = self.session.execute(stmt).scalars().all()
+        return set(result)
+
 
     # ------------------------------------------------------------------
     # 리스트 조회: 게스트 + NEEDS_REPLY 전용
@@ -94,9 +111,10 @@ class IncomingMessageRepository:
         self,
         *,
         gmail_message_id: str,
-        thread_id: str,
+        airbnb_thread_id: str,
         subject: str | None,
         from_email: str | None,
+        reply_to: str | None = None,
         received_at,
         origin,              # OriginClassificationResult
         intent_result,       # IntentClassificationResult | None
@@ -113,11 +131,15 @@ class IncomingMessageRepository:
         파싱된 Gmail 메시지로부터 IncomingMessage 엔티티 생성.
         text_body / html_body 는 DB에 저장하지 않는다 (pure_guest_message만 저장).
         """
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        
         msg = IncomingMessage(
             gmail_message_id=gmail_message_id,
-            thread_id=thread_id,
+            airbnb_thread_id=airbnb_thread_id,
             subject=subject,
             from_email=from_email,
+            reply_to=reply_to,
             received_at=received_at,
 
             sender_actor=origin.actor,
@@ -138,6 +160,14 @@ class IncomingMessageRepository:
             guest_name=guest_name,
             checkin_date=checkin_date,
             checkout_date=checkout_date,
+            
+            # direction: HOST이면 outgoing, 나머지는 incoming
+            direction=MessageDirection.outgoing if origin.actor == MessageActor.HOST else MessageDirection.incoming,
+            has_attachment=False,  # TODO: Gmail 파싱에서 첨부파일 확인 로직 추가
+            is_system_generated=(origin.actor == MessageActor.SYSTEM),
+            
+            created_at=now,
+            updated_at=now,
         )
 
         self.session.add(msg)

@@ -1,19 +1,31 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.session import init_db
 from app.api.v1.api import api_router
 from app.api.v1.auth_google import router as auth_google_router
-from app.api.v1.webhooks import router as webhook_router
-from app.api.v1 import properties
-from app.api.v1 import ota_listings
+from app.services.scheduler import start_scheduler, shutdown_scheduler
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI Lifespan - 앱 시작/종료 시 실행
+    """
+    # Startup
+    start_scheduler(interval_minutes=5)
+    yield
+    # Shutdown
+    shutdown_scheduler()
 
 
 def create_app() -> FastAPI:
     app = FastAPI(
         title="TONO Operation Backend",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     app.add_middleware(
@@ -32,14 +44,7 @@ def create_app() -> FastAPI:
 
     # 기타 API
     app.include_router(auth_google_router)
-    app.include_router(webhook_router)
-
-    # Property 관련 API
-    app.include_router(properties.router)
-
-        # OTA 리스팅 매핑 관련 API
-    app.include_router(ota_listings.router)
-
+    
     return app
 
 app = create_app()

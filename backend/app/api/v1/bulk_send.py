@@ -1,20 +1,26 @@
+"""
+Bulk Send API - 단순화된 버전
+- Preview 없음
+- Job 없음  
+- confirm_token 없음
+- 선택된 Conversation들을 직접 순차 발송
+"""
 from __future__ import annotations
 
 import base64
 import json
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import desc, select
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from sqlalchemy import asc, desc, select
 from sqlalchemy.orm import Session
 
 from app.adapters.gmail_send_adapter import GmailSendAdapter
 from app.db.session import get_db
 from app.domain.models.conversation import (
-    BulkSendJob,
-    BulkSendJobStatus,
     Conversation,
     ConversationChannel,
     ConversationStatus,
@@ -23,22 +29,49 @@ from app.domain.models.conversation import (
 )
 from app.domain.models.incoming_message import IncomingMessage, MessageDirection
 from app.domain.intents import MessageActor
-from app.services.conversation_thread_service import ConfirmTokenService, DraftService, SendLogService
+from app.services.conversation_thread_service import DraftService, SendLogService
 from app.services.gmail_fetch_service import get_gmail_service
-from app.api.v1.schemas.bulk_send import (
-    BulkSendEligibleResponse,
-    BulkSendJobDTO,
-    BulkSendPreviewItemDTO,
-    BulkSendPreviewRequest,
-    BulkSendPreviewResponse,
-    BulkSendResultItemDTO,
-    BulkSendSendRequest,
-    BulkSendSendResponse,
-)
+from app.services.send_event_handler import SendEventHandler
 from app.api.v1.schemas.conversation import ConversationListItemDTO
 
 router = APIRouter(prefix="/bulk-send", tags=["bulk-send"])
 
+
+# ============================================================
+# Schemas
+# ============================================================
+
+class BulkSendEligibleResponse(BaseModel):
+    """Bulk Send 가능한 Conversation 목록"""
+    items: List[ConversationListItemDTO]
+    next_cursor: Optional[str] = None
+
+
+class BulkSendRequest(BaseModel):
+    """Bulk Send 요청 - conversation_ids만 필요"""
+    conversation_ids: List[UUID]
+
+
+class BulkSendResultItem(BaseModel):
+    """개별 Conversation 발송 결과"""
+    conversation_id: UUID
+    result: str  # "sent" | "skipped" | "failed"
+    error_message: Optional[str] = None
+    sent_at: Optional[datetime] = None
+
+
+class BulkSendResponse(BaseModel):
+    """Bulk Send 응답"""
+    total: int
+    sent: int
+    skipped: int
+    failed: int
+    results: List[BulkSendResultItem]
+
+
+# ============================================================
+# Helpers
+# ============================================================
 
 def _encode_cursor(dt: datetime, cid: UUID) -> str:
     payload = {"dt": dt.isoformat(), "id": str(cid)}
@@ -51,17 +84,20 @@ def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
     return datetime.fromisoformat(obj["dt"]), UUID(obj["id"])
 
 
-def _safety_literal(s: SafetyStatus) -> str:
-    return "pass" if s == SafetyStatus.pass_ else s.value
-
+# ============================================================
+# Endpoints
+# ============================================================
 
 @router.get("/eligible-conversations", response_model=BulkSendEligibleResponse)
-def eligible(
+def get_eligible_conversations(
     limit: int = Query(50, ge=1, le=200),
     cursor: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    # status=ready_to_send AND safety=pass AND draft exists(pass)
+    """
+    Bulk Send 가능한 Conversation 목록 조회
+    조건: status=ready_to_send AND safety=pass AND draft(pass) 존재
+    """
     q = (
         select(Conversation)
         .where(
@@ -74,197 +110,168 @@ def eligible(
 
     if cursor:
         c_dt, c_id = _decode_cursor(cursor)
-        q = q.where((Conversation.updated_at < c_dt) | ((Conversation.updated_at == c_dt) & (Conversation.id < c_id)))
+        q = q.where(
+            (Conversation.updated_at < c_dt) | 
+            ((Conversation.updated_at == c_dt) & (Conversation.id < c_id))
+        )
 
     rows = db.execute(q.limit(limit + 1)).scalars().all()
+    
     next_cursor = None
     if len(rows) > limit:
         last = rows[limit - 1]
         next_cursor = _encode_cursor(last.updated_at, last.id)
         rows = rows[:limit]
 
+    # Draft가 pass인 것만 필터링
     eligible_rows: list[Conversation] = []
-    for c in rows:
-        d = DraftService(db).get_latest(conversation_id=c.id)
-        if d and d.safety_status == SafetyStatus.pass_:
-            eligible_rows.append(c)
+    for conv in rows:
+        draft = DraftService(db).get_latest(conversation_id=conv.id)
+        if draft and draft.safety_status == SafetyStatus.pass_:
+            eligible_rows.append(conv)
 
-    items = [
-        ConversationListItemDTO(
+    # 각 conversation의 게스트 정보 조회
+    items = []
+    for r in eligible_rows:
+        # 해당 thread의 첫 번째 incoming 메시지에서 게스트 정보 가져오기
+        guest_msg = db.execute(
+            select(IncomingMessage)
+            .where(IncomingMessage.airbnb_thread_id == r.airbnb_thread_id)
+            .where(IncomingMessage.direction == MessageDirection.incoming)
+            .where(IncomingMessage.guest_name.isnot(None))
+            .order_by(asc(IncomingMessage.received_at))
+            .limit(1)
+        ).scalar_one_or_none()
+        
+        items.append(ConversationListItemDTO(
             id=r.id,
             channel="gmail",
-            thread_id=r.thread_id,
+            airbnb_thread_id=r.airbnb_thread_id,
             status=r.status.value,
             safety_status="pass",
             last_message_id=r.last_message_id,
             updated_at=r.updated_at,
-        )
-        for r in eligible_rows
-    ]
+            guest_name=guest_msg.guest_name if guest_msg else None,
+            checkin_date=str(guest_msg.checkin_date) if guest_msg and guest_msg.checkin_date else None,
+            checkout_date=str(guest_msg.checkout_date) if guest_msg and guest_msg.checkout_date else None,
+        ))
+    
     return BulkSendEligibleResponse(items=items, next_cursor=next_cursor)
 
 
-@router.post("/preview", response_model=BulkSendPreviewResponse)
-def preview(body: BulkSendPreviewRequest, db: Session = Depends(get_db)):
+@router.post("/send", response_model=BulkSendResponse)
+def bulk_send(body: BulkSendRequest, db: Session = Depends(get_db)):
+    """
+    Bulk Send 실행
+    - Preview/Job/Token 없음
+    - 선택된 conversation_ids를 순차 발송
+    - 실패해도 다음 건 계속 진행
+    """
     if not body.conversation_ids:
-        raise HTTPException(status_code=400, detail="conversation_ids required")
-
-    convs = db.execute(select(Conversation).where(Conversation.id.in_(body.conversation_ids))).scalars().all()
-    if len(convs) != len(set(body.conversation_ids)):
-        raise HTTPException(status_code=400, detail="Some conversations not found")
-
-    job = BulkSendJob(conversation_ids=list(body.conversation_ids), status=BulkSendJobStatus.pending)
-    db.add(job)
-    db.flush()
-
-    previews: list[BulkSendPreviewItemDTO] = []
-    for conv in convs:
-        draft = DraftService(db).get_latest(conversation_id=conv.id)
-
-        if not draft:
-            previews.append(
-                BulkSendPreviewItemDTO(
-                    conversation_id=conv.id,
-                    thread_id=conv.thread_id,
-                    draft_reply_id=None,
-                    safety_status=_safety_literal(conv.safety_status),
-                    can_send=False,
-                    preview_content=None,
-                    blocked_reason="draft_missing",
-                )
-            )
-            continue
-
-        can_send = (
-            conv.status == ConversationStatus.ready_to_send
-            and conv.safety_status == SafetyStatus.pass_
-            and draft.safety_status == SafetyStatus.pass_
-            and bool(conv.thread_id)
-        )
-        previews.append(
-            BulkSendPreviewItemDTO(
-                conversation_id=conv.id,
-                thread_id=conv.thread_id,
-                draft_reply_id=draft.id,
-                safety_status=_safety_literal(draft.safety_status),
-                can_send=can_send,
-                preview_content=draft.content if can_send else None,
-                blocked_reason=None if can_send else "not_eligible",
-            )
-        )
-
-        # preview 로그 (Conversation별)
-        SendLogService(db).log(conversation=conv, action=SendAction.preview, message_id=None)
-
-    token = ConfirmTokenService().issue(
-        payload={
-            "t": "bulk_send",
-            "job_id": str(job.id),
-            "conversation_ids": [str(x) for x in job.conversation_ids],
-        }
-    )
-
-    db.commit()
-
-    return BulkSendPreviewResponse(
-        job=BulkSendJobDTO(
-            id=job.id,
-            status=job.status.value,
-            conversation_ids=job.conversation_ids,
-            created_at=job.created_at,
-            completed_at=job.completed_at,
-        ),
-        previews=previews,
-        confirm_token=token,
-    )
-
-
-@router.post("/{job_id}/send", response_model=BulkSendSendResponse)
-def send(job_id: UUID, body: BulkSendSendRequest, db: Session = Depends(get_db)):
-    job = db.execute(select(BulkSendJob).where(BulkSendJob.id == job_id)).scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != BulkSendJobStatus.pending:
-        raise HTTPException(status_code=400, detail="Job not pending")
-
-    try:
-        payload = ConfirmTokenService().verify(token=body.confirm_token)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid confirm token")
-
-    if payload.get("t") != "bulk_send" or payload.get("job_id") != str(job.id):
-        raise HTTPException(status_code=400, detail="Confirm token mismatch")
+        return BulkSendResponse(total=0, sent=0, skipped=0, failed=0, results=[])
 
     gmail_service = get_gmail_service(db)
     sender = GmailSendAdapter(service=gmail_service)
 
-    results: list[BulkSendResultItemDTO] = []
-    any_failed = False
-    any_sent = False
+    results: list[BulkSendResultItem] = []
+    sent_count = 0
+    skipped_count = 0
+    failed_count = 0
 
-    for cid in job.conversation_ids:
-        conv = db.execute(select(Conversation).where(Conversation.id == cid)).scalar_one_or_none()
+    for cid in body.conversation_ids:
+        conv = db.execute(
+            select(Conversation).where(Conversation.id == cid)
+        ).scalar_one_or_none()
+        
         if not conv:
-            any_failed = True
-            results.append(
-                BulkSendResultItemDTO(
-                    conversation_id=cid,
-                    result="failed",
-                    error_code="conversation_not_found",
-                    error_message="Conversation not found",
-                )
-            )
+            failed_count += 1
+            results.append(BulkSendResultItem(
+                conversation_id=cid,
+                result="failed",
+                error_message="Conversation not found",
+            ))
             continue
 
+        # 발송 조건 체크
         draft = DraftService(db).get_latest(conversation_id=conv.id)
-        if (
-            not conv.thread_id
-            or conv.status != ConversationStatus.ready_to_send
-            or conv.safety_status != SafetyStatus.pass_
-            or not draft
-            or draft.safety_status != SafetyStatus.pass_
-        ):
-            results.append(BulkSendResultItemDTO(conversation_id=conv.id, result="skipped"))
+        
+        skip_reason = None
+        if not conv.airbnb_thread_id:
+            skip_reason = "airbnb_thread_id missing"
+        elif conv.status != ConversationStatus.ready_to_send:
+            skip_reason = f"status is {conv.status.value}"
+        elif conv.safety_status != SafetyStatus.pass_:
+            skip_reason = f"safety is {conv.safety_status.value}"
+        elif not draft:
+            skip_reason = "draft not found"
+        elif draft.safety_status != SafetyStatus.pass_:
+            skip_reason = f"draft safety is {draft.safety_status.value}"
+        elif draft.airbnb_thread_id != conv.airbnb_thread_id:
+            skip_reason = "draft airbnb_thread_id mismatch"
+
+        if skip_reason:
+            skipped_count += 1
+            results.append(BulkSendResultItem(
+                conversation_id=conv.id,
+                result="skipped",
+                error_message=skip_reason,
+            ))
             continue
 
+        # 수신자 이메일 조회
         last_incoming = db.execute(
             select(IncomingMessage)
-            .where(IncomingMessage.thread_id == conv.thread_id, IncomingMessage.direction == MessageDirection.incoming)
+            .where(
+                IncomingMessage.airbnb_thread_id == conv.airbnb_thread_id,
+                IncomingMessage.direction == MessageDirection.incoming
+            )
             .order_by(desc(IncomingMessage.received_at), desc(IncomingMessage.id))
             .limit(1)
         ).scalar_one_or_none()
 
-        if not last_incoming or not last_incoming.from_email:
-            any_failed = True
+        if not last_incoming:
+            failed_count += 1
             conv.status = ConversationStatus.blocked
             db.add(conv)
-            results.append(
-                BulkSendResultItemDTO(
-                    conversation_id=conv.id,
-                    result="failed",
-                    error_code="recipient_missing",
-                    error_message="Recipient email missing",
-                )
-            )
+            results.append(BulkSendResultItem(
+                conversation_id=conv.id,
+                result="failed",
+                error_message="No incoming message found",
+            ))
             continue
 
+        # reply_to가 없으면 발송 불가
+        if not last_incoming.reply_to:
+            failed_count += 1
+            conv.status = ConversationStatus.blocked
+            db.add(conv)
+            results.append(BulkSendResultItem(
+                conversation_id=conv.id,
+                result="failed",
+                error_message="Reply-To not found. Cannot send reply.",
+            ))
+            continue
+
+        # Gmail 발송
         try:
             resp = sender.send_reply(
-                thread_id=conv.thread_id,
-                to_email=last_incoming.from_email,
+                airbnb_thread_id=conv.airbnb_thread_id,
+                to_email=last_incoming.reply_to,
                 subject=last_incoming.subject or "TONO Reply",
                 reply_text=draft.content,
                 original_message_id=None,
             )
+            
             out_gmail_message_id = resp.get("id")
-            out_thread_id = resp.get("threadId") or conv.thread_id
+            out_thread_id = resp.get("threadId") or conv.airbnb_thread_id
 
             if not out_thread_id:
-                raise RuntimeError("Outgoing thread_id missing")
+                raise RuntimeError("Outgoing airbnb_thread_id missing")
 
+            # Outgoing 메시지 저장
             out_msg = IncomingMessage(
                 gmail_message_id=str(out_gmail_message_id),
-                thread_id=out_thread_id,
+                airbnb_thread_id=out_thread_id,
                 subject=last_incoming.subject,
                 from_email=None,
                 received_at=datetime.utcnow(),
@@ -288,41 +295,67 @@ def send(job_id: UUID, body: BulkSendSendRequest, db: Session = Depends(get_db))
             db.add(out_msg)
             db.flush()
 
-            conv.thread_id = out_thread_id
+            # Conversation 상태 업데이트
+            conv.airbnb_thread_id = out_thread_id
             conv.last_message_id = out_msg.id
             conv.status = ConversationStatus.sent
             conv.updated_at = datetime.utcnow()
             db.add(conv)
 
-            SendLogService(db).log(conversation=conv, action=SendAction.bulk_send, message_id=out_msg.id)
-
-            any_sent = True
-            results.append(
-                BulkSendResultItemDTO(conversation_id=conv.id, result="sent", sent_at=datetime.utcnow())
+            # 로그
+            SendLogService(db=db).log_action(
+                conversation=conv, 
+                action=SendAction.send, 
+                message_id=out_msg.id,
+                content_sent=draft.content,
+                payload_json={
+                    "gmail_message_id": out_msg.gmail_message_id,
+                    "airbnb_thread_id": out_thread_id,
+                }
             )
+            
+            # 🆕 Commitment + OC 추출 (발송 후)
+            try:
+                import asyncio
+                send_handler = SendEventHandler(db)
+                # bulk에서는 동기로 처리 (이미 루프 안이므로)
+                asyncio.get_event_loop().run_until_complete(
+                    send_handler.on_message_sent(
+                        sent_text=draft.content,
+                        airbnb_thread_id=out_thread_id,
+                        property_code=last_incoming.property_code or "",
+                        message_id=out_msg.id,
+                        conversation_id=conv.id,
+                        guest_checkin_date=last_incoming.checkin_date,  # OC target_date 계산용
+                    )
+                )
+            except Exception as ce:
+                # Commitment 추출 실패해도 발송은 성공 처리
+                pass
+
+            sent_count += 1
+            results.append(BulkSendResultItem(
+                conversation_id=conv.id,
+                result="sent",
+                sent_at=datetime.utcnow(),
+            ))
+
         except Exception as e:
-            any_failed = True
+            failed_count += 1
             conv.status = ConversationStatus.blocked
             db.add(conv)
-            results.append(
-                BulkSendResultItemDTO(
-                    conversation_id=conv.id,
-                    result="failed",
-                    error_code="send_failed",
-                    error_message=str(e),
-                )
-            )
-
-    if any_failed and any_sent:
-        job.status = BulkSendJobStatus.partial_failed
-    elif any_failed and not any_sent:
-        job.status = BulkSendJobStatus.failed
-    else:
-        job.status = BulkSendJobStatus.completed
-
-    job.completed_at = datetime.utcnow()
-    db.add(job)
+            results.append(BulkSendResultItem(
+                conversation_id=conv.id,
+                result="failed",
+                error_message=str(e),
+            ))
 
     db.commit()
 
-    return BulkSendSendResponse(job_id=job.id, status=job.status.value, results=results)
+    return BulkSendResponse(
+        total=len(body.conversation_ids),
+        sent=sent_count,
+        skipped=skipped_count,
+        failed=failed_count,
+        results=results,
+    )

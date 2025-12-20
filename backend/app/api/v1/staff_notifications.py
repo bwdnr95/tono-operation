@@ -1,20 +1,47 @@
+"""
+Staff Notification & Operational Commitment API
+
+Staff Notification = OC 기반
+"약속 존재"가 아니라 "운영 리스크 발생 시점"만 노출
+
+Endpoints:
+- GET /staff-notifications - Action Queue (노출 대상 OC)
+- GET /staff-notifications/{oc_id} - 단일 OC 조회
+- POST /staff-notifications/{oc_id}/done - 완료 처리
+- POST /staff-notifications/{oc_id}/confirm-resolve - suggested_resolve 확정
+- POST /staff-notifications/{oc_id}/reject-resolve - suggested_resolve 거부
+- POST /staff-notifications/{oc_id}/confirm-candidate - 후보 확정
+- POST /staff-notifications/{oc_id}/reject-candidate - 후보 거부
+- GET /conversations/{airbnb_thread_id}/ocs - Conversation의 OC 목록 (Backlog)
+"""
 from __future__ import annotations
 
-from datetime import datetime
+import logging
+from datetime import date, datetime
 from typing import List, Optional
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
-from app.repositories.staff_notification_repository import StaffNotificationRepository
-from app.domain.models.staff_notification_record import StaffNotificationRecord
+from app.domain.models.conversation import Conversation
+from app.domain.models.operational_commitment import (
+    OperationalCommitment,
+    OCStatus,
+    OCPriority,
+    StaffNotificationItem,
+)
+from app.services.oc_service import OCService
+
+logger = logging.getLogger(__name__)
 
 
-# ----------------------------
+# ─────────────────────────────────────────────────────────────
 # DB Session
-# ----------------------------
+# ─────────────────────────────────────────────────────────────
 
 def get_db():
     db = SessionLocal()
@@ -24,163 +51,331 @@ def get_db():
         db.close()
 
 
-# ----------------------------
-# Pydantic Models
-# ----------------------------
+# ─────────────────────────────────────────────────────────────
+# DTOs
+# ─────────────────────────────────────────────────────────────
 
-class StaffNotificationUpdate(BaseModel):
-    """
-    PATCH 요청 바디
-    { "status": "RESOLVED" }
-    """
-    status: str  # "OPEN" | "IN_PROGRESS" | "RESOLVED"
+class OCDTO(BaseModel):
+    id: str
+    conversation_id: str
+    topic: str
+    description: str
+    evidence_quote: str
+    target_time_type: str
+    target_date: Optional[str]
+    status: str
+    resolution_reason: Optional[str]
+    resolution_evidence: Optional[str]  # 해소 제안 근거 (게스트 메시지)
+    is_candidate_only: bool
+    created_at: str
+    
+    class Config:
+        from_attributes = True
 
 
-class StaffNotificationOut(BaseModel):
-    id: int
-    message_id: int
-    property_code: Optional[str]
-    ota: Optional[str]
+class OCListResponse(BaseModel):
+    airbnb_thread_id: str
+    items: List[OCDTO]
+    total: int
+
+
+class StaffNotificationDTO(BaseModel):
+    """Staff Notification 항목 (Action Queue용)"""
+    oc_id: str
+    conversation_id: str
+    airbnb_thread_id: str
+    topic: str
+    description: str
+    evidence_quote: str
+    priority: str  # immediate, upcoming, pending
     guest_name: Optional[str]
     checkin_date: Optional[str]
-    checkout_date: Optional[str] = None
-    message_summary: str
-    follow_up_actions: List[str]
+    checkout_date: Optional[str]
     status: str
-    created_at: datetime
-    resolved_at: Optional[datetime] = None
-
-    class Config:
-        orm_mode = True
-
-
-router = APIRouter(
-    prefix="/staff-notifications",
-    tags=["staff_notifications"],
-)
+    resolution_reason: Optional[str]
+    resolution_evidence: Optional[str]  # 해소 제안 근거 (게스트 메시지)
+    is_candidate_only: bool
+    target_time_type: str
+    target_date: Optional[str]
+    created_at: Optional[str]
 
 
-# ----------------------------
-# PATCH: Update Notification Status
-# ----------------------------
-
-@router.patch(
-    "/{notification_id}",
-    response_model=StaffNotificationOut,
-    status_code=status.HTTP_200_OK,
-)
-def update_staff_notification_status(
-    notification_id: int,
-    update: StaffNotificationUpdate,   # ← JSON Body "{status: 'RESOLVED'}"
-    db: Session = Depends(get_db),
-):
-    repo = StaffNotificationRepository(db)
-
-    rec: StaffNotificationRecord | None = repo.get(notification_id)
-    if rec is None:
-        raise HTTPException(status_code=404, detail="Notification not found")
-
-    new_status = update.status.upper()
-    if new_status not in ("OPEN", "IN_PROGRESS", "RESOLVED"):
-        raise HTTPException(status_code=400, detail="Invalid status value")
-
-    now = datetime.utcnow()
-
-    rec.status = new_status
-    rec.updated_at = now
-    rec.resolved_at = now if new_status == "RESOLVED" else None
-
-    db.add(rec)
-    db.commit()
-    db.refresh(rec)
-
-    return StaffNotificationOut(
-        id=rec.id,
-        message_id=rec.message_id,
-        property_code=rec.property_code,
-        ota=rec.ota,
-        guest_name=rec.guest_name,
-        checkin_date=str(rec.checkin_date) if rec.checkin_date else None,
-        checkout_date=str(rec.checkout_date) if getattr(rec, "checkout_date", None) else None,
-        message_summary=rec.message_summary,
-        follow_up_actions=rec.follow_up_actions or [],
-        status=rec.status,
-        created_at=rec.created_at,
-        resolved_at=rec.resolved_at,
-    )
+class StaffNotificationListResponse(BaseModel):
+    items: List[StaffNotificationDTO]
+    total: int
+    as_of: str  # 조회 기준 날짜
 
 
-# ----------------------------
-# GET: List Notifications
-# ----------------------------
+class OCActionResponse(BaseModel):
+    oc_id: str
+    status: str
+    action: str
+    success: bool
 
-@router.get("", response_model=List[StaffNotificationOut])
-def list_staff_notifications(
-    unresolved_only: bool = Query(False, description="true이면 RESOLVED 제외"),
-    property_code: Optional[str] = Query(None),
-    ota: Optional[str] = Query(None),
+
+# ─────────────────────────────────────────────────────────────
+# Router
+# ─────────────────────────────────────────────────────────────
+
+router = APIRouter(prefix="/staff-notifications", tags=["staff-notifications"])
+
+
+# ─────────────────────────────────────────────────────────────
+# Staff Notification Endpoints
+# ─────────────────────────────────────────────────────────────
+
+@router.get("", response_model=StaffNotificationListResponse)
+def get_staff_notifications(
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    repo = StaffNotificationRepository(db)
-
-    # ✅ 레포에는 status를 단일 값으로만 넘긴다 (또는 None)
-    # unresolved_only 기능은 파이썬 레벨에서 처리
-    records = repo.list(
-        status=None,               # ← 여기! 더 이상 ['OPEN','IN_PROGRESS'] 같은 리스트 안 넘김
-        property_code=property_code,
-        ota=ota,
-        limit=limit,
+    """
+    Staff Notification Action Queue
+    
+    지금 처리해야 할 OC 목록 (노출 조건 만족하는 것만)
+    
+    노출 규칙:
+    - status = pending or suggested_resolve
+    - explicit: D-1부터 노출
+    - implicit: 즉시 노출
+    - 체류 중: 최상단 고정
+    """
+    today = date.today()
+    service = OCService(db)
+    
+    items = service.get_staff_notifications(today=today, limit=limit)
+    
+    return StaffNotificationListResponse(
+        items=[
+            StaffNotificationDTO(
+                oc_id=str(item.oc_id),
+                conversation_id=str(item.conversation_id),
+                airbnb_thread_id=item.airbnb_thread_id,
+                topic=item.topic,
+                description=item.description,
+                evidence_quote=item.evidence_quote,
+                priority=item.priority.value,
+                guest_name=item.guest_name,
+                checkin_date=item.checkin_date.isoformat() if item.checkin_date else None,
+                checkout_date=item.checkout_date.isoformat() if item.checkout_date else None,
+                status=item.status,
+                resolution_reason=item.resolution_reason,
+                resolution_evidence=item.resolution_evidence,
+                is_candidate_only=item.is_candidate_only,
+                target_time_type=item.target_time_type,
+                target_date=item.target_date.isoformat() if item.target_date else None,
+                created_at=item.created_at.isoformat() if item.created_at else None,
+            )
+            for item in items
+        ],
+        total=len(items),
+        as_of=today.isoformat(),
     )
 
-    if unresolved_only:
-        # ✅ RESOLVED 아닌 것만 남기기
-        records = [r for r in records if r.status != "RESOLVED"]
 
-    return [
-        StaffNotificationOut(
-            id=r.id,
-            message_id=r.message_id,
-            property_code=r.property_code,
-            ota=r.ota,
-            guest_name=r.guest_name,
-            checkin_date=str(r.checkin_date) if r.checkin_date else None,
-            checkout_date=str(r.checkout_date) if getattr(r, "checkout_date", None) else None,
-            message_summary=r.message_summary,
-            follow_up_actions=r.follow_up_actions or [],
-            status=r.status,
-            created_at=r.created_at,
-            resolved_at=r.resolved_at,
-        )
-        for r in records
-    ]
-
-
-# ----------------------------
-# GET: Single Notification
-# ----------------------------
-
-@router.get("/{notification_id}", response_model=StaffNotificationOut)
+@router.get("/{oc_id}", response_model=OCDTO)
 def get_staff_notification(
-    notification_id: int,
+    oc_id: UUID,
     db: Session = Depends(get_db),
 ):
-    repo = StaffNotificationRepository(db)
-    record = repo.get(notification_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Notification not found")
+    """단일 OC 조회"""
+    from app.repositories.oc_repository import OCRepository
+    
+    repo = OCRepository(db)
+    oc = repo.get_by_id(oc_id)
+    
+    if not oc:
+        raise HTTPException(status_code=404, detail="OC not found")
+    
+    return OCDTO(
+        id=str(oc.id),
+        conversation_id=str(oc.conversation_id),
+        topic=oc.topic,
+        description=oc.description,
+        evidence_quote=oc.evidence_quote,
+        target_time_type=oc.target_time_type,
+        target_date=oc.target_date.isoformat() if oc.target_date else None,
+        status=oc.status,
+        resolution_reason=oc.resolution_reason,
+        is_candidate_only=oc.is_candidate_only,
+        created_at=oc.created_at.isoformat() if oc.created_at else None,
+    )
 
-    return StaffNotificationOut(
-        id=record.id,
-        message_id=record.message_id,
-        property_code=record.property_code,
-        ota=record.ota,
-        guest_name=record.guest_name,
-        checkin_date=str(record.checkin_date) if record.checkin_date else None,
-        checkout_date=str(record.checkout_date) if getattr(record, "checkout_date", None) else None,
-        message_summary=record.message_summary,
-        follow_up_actions=record.follow_up_actions or [],
-        status=record.status,
-        created_at=record.created_at,
-        resolved_at=record.resolved_at,
+
+# ─────────────────────────────────────────────────────────────
+# OC Action Endpoints
+# ─────────────────────────────────────────────────────────────
+
+@router.post("/{oc_id}/done", response_model=OCActionResponse)
+def mark_oc_done(
+    oc_id: UUID,
+    db: Session = Depends(get_db),
+):
+    """
+    OC 완료 처리
+    
+    운영 액션을 수행했을 때 호출
+    """
+    service = OCService(db)
+    oc = service.mark_done(oc_id, by="host")
+    
+    if not oc:
+        raise HTTPException(status_code=404, detail="OC not found")
+    
+    return OCActionResponse(
+        oc_id=str(oc_id),
+        status=oc.status,
+        action="done",
+        success=True,
+    )
+
+
+@router.post("/{oc_id}/confirm-resolve", response_model=OCActionResponse)
+def confirm_oc_resolve(
+    oc_id: UUID,
+    db: Session = Depends(get_db),
+):
+    """
+    suggested_resolve 확정
+    
+    시스템이 제안한 해소를 운영자가 1클릭으로 확정
+    """
+    service = OCService(db)
+    oc = service.confirm_resolve(oc_id, by="host")
+    
+    if not oc:
+        raise HTTPException(status_code=404, detail="OC not found or not in suggested_resolve status")
+    
+    return OCActionResponse(
+        oc_id=str(oc_id),
+        status=oc.status,
+        action="confirm_resolve",
+        success=True,
+    )
+
+
+@router.post("/{oc_id}/reject-resolve", response_model=OCActionResponse)
+def reject_oc_resolve(
+    oc_id: UUID,
+    db: Session = Depends(get_db),
+):
+    """
+    suggested_resolve 거부
+    
+    시스템 제안을 거부하고 pending으로 복귀
+    """
+    service = OCService(db)
+    oc = service.reject_resolve(oc_id)
+    
+    if not oc:
+        raise HTTPException(status_code=404, detail="OC not found")
+    
+    return OCActionResponse(
+        oc_id=str(oc_id),
+        status=oc.status,
+        action="reject_resolve",
+        success=True,
+    )
+
+
+@router.post("/{oc_id}/confirm-candidate", response_model=OCActionResponse)
+def confirm_oc_candidate(
+    oc_id: UUID,
+    db: Session = Depends(get_db),
+):
+    """
+    후보 확정
+    
+    refund/payment/compensation 등 운영자 확정 필요한 OC 확정
+    """
+    service = OCService(db)
+    oc = service.confirm_candidate(oc_id)
+    
+    if not oc:
+        raise HTTPException(status_code=404, detail="OC not found or not a candidate")
+    
+    return OCActionResponse(
+        oc_id=str(oc_id),
+        status=oc.status,
+        action="confirm_candidate",
+        success=True,
+    )
+
+
+@router.post("/{oc_id}/reject-candidate", response_model=OCActionResponse)
+def reject_oc_candidate(
+    oc_id: UUID,
+    db: Session = Depends(get_db),
+):
+    """
+    후보 거부
+    
+    잘못 추출된 OC 후보 거부
+    """
+    service = OCService(db)
+    oc = service.reject_candidate(oc_id)
+    
+    if not oc:
+        raise HTTPException(status_code=404, detail="OC not found or not a candidate")
+    
+    return OCActionResponse(
+        oc_id=str(oc_id),
+        status=oc.status,
+        action="reject_candidate",
+        success=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Conversation OC Endpoints (Backlog)
+# ─────────────────────────────────────────────────────────────
+
+@router.get("/conversations/{airbnb_thread_id}/ocs", response_model=OCListResponse)
+def get_conversation_ocs(
+    airbnb_thread_id: str,
+    include_resolved: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """
+    Conversation의 OC 목록 조회
+    
+    Backlog 화면용 - 전체 OC 조회 가능
+    """
+    # Conversation 조회
+    conv = db.execute(
+        select(Conversation).where(Conversation.airbnb_thread_id == airbnb_thread_id)
+    ).scalar_one_or_none()
+    
+    if not conv:
+        return OCListResponse(
+            airbnb_thread_id=airbnb_thread_id,
+            items=[],
+            total=0,
+        )
+    
+    service = OCService(db)
+    ocs = service.get_conversation_ocs(
+        conversation_id=conv.id,
+        include_resolved=include_resolved,
+    )
+    
+    return OCListResponse(
+        airbnb_thread_id=airbnb_thread_id,
+        items=[
+            OCDTO(
+                id=str(oc.id),
+                conversation_id=str(oc.conversation_id),
+                topic=oc.topic,
+                description=oc.description,
+                evidence_quote=oc.evidence_quote,
+                target_time_type=oc.target_time_type,
+                target_date=oc.target_date.isoformat() if oc.target_date else None,
+                status=oc.status,
+                resolution_reason=oc.resolution_reason,
+                is_candidate_only=oc.is_candidate_only,
+                created_at=oc.created_at.isoformat() if oc.created_at else None,
+            )
+            for oc in ocs
+        ],
+        total=len(ocs),
     )

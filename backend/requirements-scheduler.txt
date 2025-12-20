@@ -1,0 +1,6 @@
+# TONO Backend - 추가 필요 패키지
+# 
+# 기존 requirements.txt에 아래 패키지 추가 필요:
+#
+# APScheduler - 백그라운드 스케줄링
+apscheduler>=3.10.0

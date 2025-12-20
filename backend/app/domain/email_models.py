@@ -23,7 +23,7 @@ class AirbnbMessage:
     guest_name: Optional[str]
     listing_name: Optional[str]
     reservation_code: Optional[str]
-    thread_id: Optional[str]
+    airbnb_thread_id: Optional[str]
     intent: MessageIntent
     plain_text: str
     received_at: datetime
