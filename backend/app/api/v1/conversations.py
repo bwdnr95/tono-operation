@@ -366,7 +366,7 @@ def patch_draft(conversation_id: UUID, body: DraftPatchRequest, db: Session = De
 
 
 @router.post("/{conversation_id}/send", response_model=SendResponse)
-def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Depends(get_db)):
+async def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Depends(get_db)):
     """
     Conversation 단건 발송.
     - Draft → Send 직행 (Preview 없음)
@@ -416,9 +416,11 @@ def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Depends(g
     gmail_thread_id = None
     if last_incoming.gmail_message_id:
         try:
+            # suffix 제거 (_0, _1 등 - 같은 이메일에서 여러 메시지 분리 저장 시 사용)
+            clean_gmail_id = last_incoming.gmail_message_id.split('_')[0]
             gmail_msg = gmail_service.users().messages().get(
                 userId="me", 
-                id=last_incoming.gmail_message_id,
+                id=clean_gmail_id,
                 format="minimal"
             ).execute()
             gmail_thread_id = gmail_msg.get("threadId")
@@ -506,6 +508,12 @@ def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Depends(g
     try:
         import asyncio
         send_handler = SendEventHandler(db)
+        
+        # 대화 맥락 생성 (최근 게스트 메시지)
+        conversation_context = None
+        if last_incoming.pure_guest_message:
+            conversation_context = f"게스트 요청: {last_incoming.pure_guest_message[:500]}"
+        
         asyncio.create_task(
             send_handler.on_message_sent(
                 sent_text=draft.content,
@@ -514,6 +522,7 @@ def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Depends(g
                 message_id=out_msg.id,
                 conversation_id=conv.id,
                 guest_checkin_date=last_incoming.checkin_date,  # OC target_date 계산용
+                conversation_context=conversation_context,  # 🆕 대화 맥락 추가
             )
         )
     except Exception as e:

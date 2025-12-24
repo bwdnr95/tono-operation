@@ -300,6 +300,10 @@ class StaffNotificationItem:
     checkin_date: Optional[date] = None
     checkout_date: Optional[date] = None
     
+    # 숙소 정보 (Dashboard용)
+    property_code: Optional[str] = None
+    property_name: Optional[str] = None
+    
     # 상태
     status: str = OCStatus.pending.value
     resolution_reason: Optional[str] = None

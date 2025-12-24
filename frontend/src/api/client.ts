@@ -89,6 +89,20 @@ export function apiPost<TResponse = unknown, TBody = unknown>(
   });
 }
 
+export function apiPut<TResponse = unknown, TBody = unknown>(
+  path: string,
+  body?: TBody,
+  query?: QueryParams,
+  init?: RequestInit,
+): Promise<TResponse> {
+  return request<TResponse>(path, {
+    method: "PUT",
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    query,
+    ...init,
+  });
+}
+
 export function apiPatch<TResponse = unknown, TBody = unknown>(
   path: string,
   body?: TBody,

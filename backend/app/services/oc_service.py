@@ -368,6 +368,8 @@ class OCService:
                 guest_name=guest_msg.guest_name if guest_msg else None,
                 checkin_date=guest_msg.checkin_date if guest_msg else None,
                 checkout_date=guest_msg.checkout_date if guest_msg else None,
+                property_code=conv.property_code,
+                property_name=guest_msg.ota_listing_name if guest_msg else None,
                 status=oc.status,
                 resolution_reason=oc.resolution_reason,
                 resolution_evidence=oc.resolution_evidence,

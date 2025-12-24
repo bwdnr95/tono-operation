@@ -479,34 +479,15 @@ def _extract_guest_name(
     """
     게스트 이름 추출 규칙:
 
-      0) 예약 확정 이메일: 유니코드 특수 문자 ⁨...⁩ (U+2068...U+2069) 패턴
       1) text/html 본문에서 '예약자' 블록 찾기 (예: '유주\n\n예약자')
-      2) 그래도 못 찾으면 None (From 헤더는 더 이상 사용하지 않음)
+      2) 본문에서 '본인 인증 완료' 앞의 이름 찾기 (예약 확정 메일)
+      3) 제목에서 'XXX 님이' 패턴 찾기 (예약 확정 메일)
+      4) 그래도 못 찾으면 None (From 헤더는 더 이상 사용하지 않음)
 
     Airbnb 메일 특성상 From 은 거의 항상 "에어비앤비" 이므로,
     From 기반 게스트 이름 추출은 프로젝트 요구사항에 맞지 않는다.
     """
     base_text = (text or "") + "\n" + (html or "")
-    subject_text = subject or ""
-    
-    # 0) 예약 확정 이메일용: 유니코드 특수 문자 ⁨...⁩ (U+2068...U+2069) 패턴
-    #    Subject: "예약 확정 - ⁨Eric S.⁩ Hong 님이 12월 27일에 체크인할 예정입니다"
-    #    본문: "⁨Eric S.⁩"
-    unicode_pattern = r'\u2068([^\u2069]+)\u2069'
-    
-    # Subject에서 먼저 시도
-    m = re.search(unicode_pattern, subject_text)
-    if m:
-        candidate = m.group(1).strip()
-        if candidate and len(candidate) >= 2:
-            return candidate
-    
-    # 본문에서 시도
-    m = re.search(unicode_pattern, base_text)
-    if m:
-        candidate = m.group(1).strip()
-        if candidate and len(candidate) >= 2:
-            return candidate
 
     # 1) "[이름]\\n예약자" 패턴
     m = re.search(r"\n\s*([^\n]+?)\s*\n\s*예약자", base_text)
@@ -535,6 +516,21 @@ def _extract_guest_name(
         if candidate and "airbnb" not in candidate.lower() and "에어비앤비" not in candidate:
             return candidate
 
+    # 4) "[이름]\n본인 인증" 패턴 (예약 확정 메일)
+    m = re.search(r"\n\s*([^\n]{1,30}?)\s*\n\s*본인 인증", base_text)
+    if m:
+        candidate = m.group(1).strip()
+        if candidate and "airbnb" not in candidate.lower() and "에어비앤비" not in candidate:
+            return candidate
+
+    # 5) 제목에서 "XXX 님이" 패턴 (예약 확정 메일: "서현 윤 님이 2월 2일에 체크인할 예정입니다")
+    if subject:
+        m = re.search(r"([A-Za-z가-힣][A-Za-z가-힣\s]{0,20})\s*님이", subject)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate and "airbnb" not in candidate.lower() and "에어비앤비" not in candidate:
+                return candidate
+
     # ❌ From 헤더는 이제 게스트 이름으로 사용하지 않는다.
     #    게스트 이름을 못 찾으면 그냥 None.
     return None
@@ -550,58 +546,41 @@ def _parse_date_ymd(year: int, month: int, day: int) -> Optional[date]:
 def _find_date_after_keyword(
     text: str,
     keywords: list[str],
-    received_at: Optional[datetime] = None,
-    is_checkout: bool = False,
 ) -> Optional[date]:
     """
     'Check-in', '체크인' 같은 키워드가 포함된 줄 또는 그 다음 줄에서 날짜 패턴을 찾는다.
     - YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD
     - YYYY년 M월 D일
-    - M월 D일 (연도 없음 - received_at 기준으로 추정)
     
-    is_checkout=True일 때, 같은 줄에 체크인/체크아웃이 함께 있으면 두 번째 날짜를 반환
+    예약 확정 메일 형식:
+        체크인               체크아웃
+        2026년 2월 2일 (월)   2026년 2월 5일 (목)
     """
-    base_year = (received_at.year if received_at else datetime.utcnow().year)
-    
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if not any(k in line for k in keywords):
             continue
 
-        # 체크인과 체크아웃이 같은 줄에 있는지 확인
-        has_both = ("체크인" in line or "Check-in" in line or "Check In" in line) and \
-                   ("체크아웃" in line or "Check-out" in line or "Check Out" in line)
+        # 같은 줄에서 찾기
+        m = DATE_NUMERIC_REGEX.search(line)
+        if m:
+            return _parse_date_ymd(int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
-        # 키워드가 있는 줄 + 다음 3줄까지 검색
-        search_lines = [line] + [lines[j] for j in range(i + 1, min(i + 4, len(lines)))]
-        
-        for search_line in search_lines:
-            # 숫자 포맷
-            m = DATE_NUMERIC_REGEX.search(search_line)
+        m2 = DATE_KR_FULL_REGEX.search(line)
+        if m2:
+            return _parse_date_ymd(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+
+        # 다음 줄들에서도 찾기 (최대 3줄)
+        for j in range(i + 1, min(i + 4, len(lines))):
+            next_line = lines[j]
+            
+            m = DATE_NUMERIC_REGEX.search(next_line)
             if m:
                 return _parse_date_ymd(int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
-            # 한글 풀 포맷 (연도 포함) - 여러 개 있을 수 있음
-            matches_full = DATE_KR_FULL_REGEX.findall(search_line)
-            if matches_full:
-                if has_both and is_checkout and len(matches_full) >= 2:
-                    # 체크아웃은 두 번째 날짜
-                    y, m, d = matches_full[1]
-                    return _parse_date_ymd(int(y), int(m), int(d))
-                else:
-                    y, m, d = matches_full[0]
-                    return _parse_date_ymd(int(y), int(m), int(d))
-            
-            # 한글 짧은 포맷 (연도 없음): "12월 27일 (토)" - 여러 개 있을 수 있음
-            matches_short = DATE_KR_SHORT_REGEX.findall(search_line)
-            if matches_short:
-                if has_both and is_checkout and len(matches_short) >= 2:
-                    # 체크아웃은 두 번째 날짜
-                    m, d = matches_short[1]
-                    return _parse_date_ymd(base_year, int(m), int(d))
-                else:
-                    m, d = matches_short[0]
-                    return _parse_date_ymd(base_year, int(m), int(d))
+            m2 = DATE_KR_FULL_REGEX.search(next_line)
+            if m2:
+                return _parse_date_ymd(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
 
     return None
 
@@ -609,25 +588,50 @@ def _find_date_after_keyword(
 def _extract_stay_dates_from_body(
     text: str | None,
     html: str | None,
-    received_at: Optional[datetime] = None,
 ) -> Tuple[Optional[date], Optional[date]]:
     """
     Airbnb 메일 본문에서 체크인/체크아웃 날짜를 추출.
+    
+    패턴 1: 체크인/체크아웃이 같은 줄에 있고 날짜가 다음 줄에 나란히
+        체크인               체크아웃
+        2026년 2월 2일 (월)   2026년 2월 5일 (목)
+    
+    패턴 2: 체크인/체크아웃이 각각 다른 줄에 날짜와 함께
+        체크인: 2026년 2월 2일
+        체크아웃: 2026년 2월 5일
     """
-    base = (text or "")  # 일단 text 위주로 탐색
-
-    checkin = _find_date_after_keyword(
-        base,
-        ["Check-in", "Check In", "체크인", "입실"],
-        received_at=received_at,
-        is_checkout=False,
-    )
-    checkout = _find_date_after_keyword(
-        base,
-        ["Check-out", "Check Out", "체크아웃", "퇴실"],
-        received_at=received_at,
-        is_checkout=True,
-    )
+    base = (text or "")
+    lines = base.splitlines()
+    
+    checkin = None
+    checkout = None
+    
+    # 패턴 1: "체크인 ... 체크아웃" 같은 줄에 있는 경우
+    for i, line in enumerate(lines):
+        if "체크인" in line and "체크아웃" in line:
+            # 다음 줄에서 모든 날짜 추출
+            for j in range(i + 1, min(i + 4, len(lines))):
+                next_line = lines[j]
+                all_dates = DATE_KR_FULL_REGEX.findall(next_line)
+                if len(all_dates) >= 2:
+                    # 첫 번째 = 체크인, 두 번째 = 체크아웃
+                    checkin = _parse_date_ymd(int(all_dates[0][0]), int(all_dates[0][1]), int(all_dates[0][2]))
+                    checkout = _parse_date_ymd(int(all_dates[1][0]), int(all_dates[1][1]), int(all_dates[1][2]))
+                    return checkin, checkout
+                elif len(all_dates) == 1 and not checkin:
+                    checkin = _parse_date_ymd(int(all_dates[0][0]), int(all_dates[0][1]), int(all_dates[0][2]))
+    
+    # 패턴 2: 기존 방식 (각각 별도 줄)
+    if not checkin:
+        checkin = _find_date_after_keyword(
+            base,
+            ["Check-in", "Check In", "체크인", "입실"],
+        )
+    if not checkout:
+        checkout = _find_date_after_keyword(
+            base,
+            ["Check-out", "Check Out", "체크아웃", "퇴실"],
+        )
 
     return checkin, checkout
 
@@ -683,7 +687,7 @@ def _extract_stay_dates(
       1) 본문에서 키워드 기반 날짜 파싱
       2) 실패하면 제목에서 "(12월 8일~9일)" 패턴 찾기
     """
-    checkin, checkout = _extract_stay_dates_from_body(text, html, received_at=received_at)
+    checkin, checkout = _extract_stay_dates_from_body(text, html)
 
     if not checkin or not checkout:
         alt_checkin, alt_checkout = _extract_stay_dates_from_subject_range(

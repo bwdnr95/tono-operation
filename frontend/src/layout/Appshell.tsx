@@ -7,8 +7,10 @@ interface AppShellProps {
 }
 
 const navItems = [
-  { to: "/", label: "Inbox", icon: "📬" },
+  { to: "/", label: "대시보드", icon: "📊" },
+  { to: "/inbox", label: "Inbox", icon: "📬" },
   { to: "/staff-notifications", label: "Staff Alerts", icon: "🔔" },
+  { to: "/properties", label: "숙소 관리", icon: "🏠" },
 ];
 
 export function AppShell({ children }: AppShellProps) {

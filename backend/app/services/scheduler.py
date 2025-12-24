@@ -223,6 +223,42 @@ async def gmail_ingest_job():
         db.close()
 
 
+async def expire_pending_reservations_job():
+    """
+    예약 요청 만료 처리 Job
+    
+    24시간이 지난 pending 상태의 예약 요청을 expired로 변경.
+    매 시간마다 실행.
+    """
+    from app.db.session import SessionLocal
+    
+    logger.info("-" * 40)
+    logger.info("예약 요청 만료 처리 Job 시작")
+    
+    db = SessionLocal()
+    try:
+        from app.repositories.pending_reservation_request_repository import (
+            PendingReservationRequestRepository,
+        )
+        repo = PendingReservationRequestRepository(db)
+        expired_count = repo.expire_old_requests()
+        
+        if expired_count > 0:
+            logger.info(f"  → {expired_count}개 예약 요청 만료 처리됨")
+        else:
+            logger.info("  → 만료 처리할 요청 없음")
+        
+    except ImportError:
+        logger.info("  → pending_reservation_request 모듈 없음 - 스킵")
+    except Exception as e:
+        logger.error(f"예약 요청 만료 처리 Job 실패: {e}")
+        db.rollback()
+    finally:
+        db.close()
+    
+    logger.info("-" * 40)
+
+
 def start_scheduler(interval_minutes: int = 5):
     """
     스케줄러 시작
@@ -247,12 +283,23 @@ def start_scheduler(interval_minutes: int = 5):
         replace_existing=True,
     )
     
+    # 예약 요청 만료 처리 Job 등록 (1시간마다)
+    _scheduler.add_job(
+        expire_pending_reservations_job,
+        trigger=IntervalTrigger(hours=1),
+        id="expire_pending_reservations_job",
+        name="예약 요청 만료 처리",
+        replace_existing=True,
+    )
+    
     _scheduler.start()
     
     logger.info("=" * 60)
     logger.info("TONO Scheduler 시작됨")
-    logger.info(f"  실행 간격: {interval_minutes}분")
-    logger.info(f"  다음 실행: {_scheduler.get_job('gmail_ingest_job').next_run_time}")
+    logger.info(f"  [Job 1] Gmail Ingest: {interval_minutes}분 간격")
+    logger.info(f"          다음 실행: {_scheduler.get_job('gmail_ingest_job').next_run_time}")
+    logger.info(f"  [Job 2] 예약 요청 만료 처리: 1시간 간격")
+    logger.info(f"          다음 실행: {_scheduler.get_job('expire_pending_reservations_job').next_run_time}")
     logger.info("=" * 60)
 
 

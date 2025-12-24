@@ -14,6 +14,8 @@ from app.api.v1 import (
     bulk_send,
     commitments,
     test_oc,  # 테스트용
+    properties,  # 숙소 관리
+    dashboard,  # 대시보드
 )
 
 api_router = APIRouter()
@@ -29,6 +31,12 @@ api_router.include_router(staff_notifications.router)
 
 # ✅ Commitment Memory (약속 기억)
 api_router.include_router(commitments.router)
+
+# ✅ Property Management (숙소 관리)
+api_router.include_router(properties.router)
+
+# ✅ Dashboard (대시보드)
+api_router.include_router(dashboard.router)
 
 # 🧪 Test API (Production에서 제거)
 api_router.include_router(test_oc.router)

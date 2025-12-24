@@ -131,50 +131,88 @@ class CommitmentExtractor:
     
     def _build_system_prompt(self) -> str:
         """시스템 프롬프트 생성"""
-        return f"""당신은 숙박 운영 AI의 '약속 추출기'입니다.
+        return f"""당신은 숙박업 운영 시스템의 "약속 추출기"입니다.
 
-호스트가 게스트에게 보낸 답변에서 "약속/허용/금지/요금/조건" 내용을 추출합니다.
+## 당신의 역할
+호스트가 게스트에게 보낸 답변에서 "약속(Commitment)"을 찾아 구조화합니다.
 
-## 추출 대상
-게스트와의 약속이 될 수 있는 내용만 추출합니다:
-- 허용: "가능합니다", "해드릴게요", "괜찮습니다"
-- 금지: "불가합니다", "어렵습니다", "안됩니다"
-- 요금: "추가 요금", "무료", "~원"
-- 변경: "변경해드렸습니다", "조정했습니다"
-- 조건부: "~하시면 가능합니다", "~경우에만"
+## 약속(Commitment)이란?
+호스트가 게스트에게 한 **구속력 있는 언급**입니다.
+핵심 판단 기준: "호스트가 이것을 지키지 않으면 게스트가 불만을 가질 수 있는가?"
 
-## 추출하지 않는 것
-- 단순 정보 안내 (체크인 시간 안내 등, 약속이 아닌 것)
-- 인사말, 감사 표현
-- 질문
+### 약속의 유형
+1. **허용/금지**: 게스트의 요청에 대한 가부 결정
+2. **행동 약속**: 호스트가 하겠다고 한 행동
+3. **요금/조건**: 금액이나 조건에 대한 확정
+4. **변경 확정**: 예약 내용 변경 확정
 
-## 출력 형식 (JSON만 출력)
+## 판단 시 고려사항
+
+### 대화 맥락이 중요합니다
+- 게스트가 무엇을 물었는지 파악하세요
+- "네 가능합니다"만 보면 모호하지만, 게스트 질문과 함께 보면 명확해집니다
+- 맥락 없이는 판단이 어려우면 confidence를 낮추세요
+
+### 약속으로 볼 수 있는 것 (예시)
+- "얼리체크인 가능합니다" → 허용 약속
+- "당일에 연락드리겠습니다" → 행동 약속
+- "추가 요금 없이 해드릴게요" → 요금 확정
+- "확인 후 다시 안내드리겠습니다" → 행동 약속
+- "수건 추가로 준비해드릴게요" → 행동 약속
+- "반려동물은 어렵습니다" → 금지
+
+### 약속이 아닌 것 (예시)
+- "체크인 시간은 15시입니다" → 고정된 숙소 정보 (변하지 않는 사실)
+- "감사합니다" → 인사
+- "궁금한 점 있으시면 말씀해주세요" → 일반적 안내
+- "좋은 하루 되세요" → 인사
+
+### 애매한 경우
+- 확실하지 않으면 추출하되 confidence를 낮게 (0.4~0.6)
+- 완전히 약속이 아닌 것만 제외하세요
+- 과소추출보다 과다추출이 낫습니다 (시스템이 나중에 필터링)
+
+## 출력 형식
+
+JSON으로만 응답하세요:
+
 ```json
 {{
   "commitments": [
     {{
-      "topic": "early_checkin | late_checkout | checkin_time | checkout_time | guest_count_change | free_provision | extra_fee | reservation_change | pet_policy | special_request | other",
-      "type": "allowance | prohibition | fee | change | condition",
-      "value": {{"allowed": true/false, "time": "HH:MM", "amount": 0, "description": "..."}},
-      "provenance_text": "추출 근거가 된 원문 문장",
+      "topic": "토픽",
+      "type": "유형",
+      "value": {{"description": "구체적 내용", ...}},
+      "provenance_text": "근거가 된 원문 문장 (정확히 복사)",
       "confidence": 0.0 ~ 1.0
     }}
   ]
 }}
 ```
 
-## 주의사항
-- 약속이 없으면 빈 배열 반환: {{"commitments": []}}
-- provenance_text는 반드시 원문에서 그대로 복사
-- confidence는 명확한 약속일수록 높게 (0.9+), 애매하면 낮게 (0.5 이하)
-- 하나의 문장에 여러 약속이 있으면 각각 분리
-
-## 허용된 topic 값
+### topic 값 (가장 적합한 것 선택, 없으면 "other")
 {self.ALLOWED_TOPICS}
 
-## 허용된 type 값
+### type 값
 {self.ALLOWED_TYPES}
-"""
+
+### value 필드 (해당하는 것만 포함)
+- "allowed": true/false (허용/금지인 경우)
+- "time": "HH:MM" (시간 관련인 경우)
+- "amount": 숫자 (금액인 경우)
+- "description": "구체적 설명" (항상 포함 권장)
+
+### confidence 가이드
+- 0.9+: 명확한 약속 ("네, 가능합니다", "해드리겠습니다")
+- 0.7~0.9: 높은 확신 (문맥상 약속으로 보임)
+- 0.5~0.7: 중간 확신 (약속일 수도 있음)
+- 0.5 미만: 낮은 확신 (애매하지만 일단 추출)
+
+## 주의사항
+- 약속이 없으면 빈 배열: {{"commitments": []}}
+- provenance_text는 원문에서 **정확히** 복사
+- 하나의 문장에 여러 약속이 있으면 각각 분리
+- 대화 맥락이 없으면 답변만으로 판단하되 confidence 낮춤"""
 
     def _build_user_prompt(
         self,
@@ -185,11 +223,12 @@ class CommitmentExtractor:
         parts = []
         
         if conversation_context:
-            parts.append(f"[대화 맥락]\n{conversation_context}\n")
+            parts.append(f"## 대화 맥락\n{conversation_context}\n")
+        else:
+            parts.append("## 대화 맥락\n(제공되지 않음 - 답변만으로 판단하되 confidence를 낮춰주세요)\n")
         
-        parts.append(f"[호스트가 보낸 답변]\n{sent_text}\n")
-        parts.append("\n위 답변에서 게스트와의 약속/허용/금지/요금/조건 내용을 추출해주세요.")
-        parts.append("JSON 형식으로만 응답하세요.")
+        parts.append(f"## 호스트가 발송한 답변\n{sent_text}\n")
+        parts.append("\n위 답변에서 게스트와의 약속(Commitment)을 추출해주세요.")
         
         return "\n".join(parts)
     
@@ -261,20 +300,31 @@ class CommitmentExtractor:
         if not topic or not type_ or not provenance_text:
             return None
         
-        # topic 유효성 검증
+        # topic 유효성 검증 - 없으면 other로 (유연하게)
         if topic not in self.ALLOWED_TOPICS:
             topic = CommitmentTopic.OTHER.value
         
-        # type 유효성 검증
+        # type 유효성 검증 - 없으면 other로 (유연하게, 기존은 무시했음)
         if type_ not in self.ALLOWED_TYPES:
-            return None  # type이 잘못되면 무시
+            # 유사한 type 매핑 시도
+            type_mapping = {
+                "allow": "allowance",
+                "permit": "allowance",
+                "deny": "prohibition",
+                "forbid": "prohibition",
+                "price": "fee",
+                "cost": "fee",
+                "modify": "change",
+                "update": "change",
+            }
+            type_ = type_mapping.get(type_, "allowance")  # 기본값 allowance
         
         # confidence 범위 보정
         confidence = max(0.0, min(1.0, float(confidence)))
         
         # value가 dict가 아니면 변환
         if not isinstance(value, dict):
-            value = {"raw": str(value)}
+            value = {"description": str(value)}
         
         return CommitmentCandidate(
             topic=topic,
@@ -286,7 +336,7 @@ class CommitmentExtractor:
 
 
 # ─────────────────────────────────────────────────────────────
-# 규칙 기반 Fallback Extractor
+# 규칙 기반 Fallback Extractor (LLM 실패 시 사용)
 # ─────────────────────────────────────────────────────────────
 
 class RuleBasedCommitmentExtractor:
@@ -297,40 +347,48 @@ class RuleBasedCommitmentExtractor:
     정확도는 낮지만, LLM 없이도 동작 가능
     """
     
-    # 토픽별 키워드
+    # 행동 약속 키워드 (새로 추가)
+    ACTION_KEYWORDS = [
+        "드리겠습니다", "하겠습니다", "해드릴게요", "해드리겠습니다",
+        "연락드리", "안내드리", "확인해드리", "준비해드리",
+        "보내드리", "전달드리",
+    ]
+    
+    # 허용/금지 키워드
+    ALLOWANCE_KEYWORDS = [
+        "가능합니다", "가능해요", "됩니다", "괜찮습니다",
+        "해드릴게요", "드릴게요", "허용",
+    ]
+    
+    PROHIBITION_KEYWORDS = [
+        "불가합니다", "불가해요", "어렵습니다", "어려워요",
+        "안됩니다", "안돼요", "금지", "제한",
+    ]
+    
+    # 토픽 감지 키워드
     TOPIC_KEYWORDS = {
         CommitmentTopic.EARLY_CHECKIN.value: [
             "얼리 체크인", "얼리체크인", "일찍 입실", "일찍 들어오",
+            "빨리 입실", "먼저 들어오",
         ],
         CommitmentTopic.LATE_CHECKOUT.value: [
             "레이트 체크아웃", "레이트체크아웃", "늦게 퇴실", "늦게 나가",
+            "늦은 퇴실",
         ],
         CommitmentTopic.EXTRA_FEE.value: [
             "추가 요금", "추가요금", "별도 비용", "추가 비용",
         ],
         CommitmentTopic.FREE_PROVISION.value: [
-            "무료로", "서비스로", "무상으로",
+            "무료로", "서비스로", "무상으로", "추가 비용 없이",
         ],
         CommitmentTopic.PET_POLICY.value: [
-            "반려동물", "강아지", "고양이", "펫",
+            "반려동물", "강아지", "고양이", "펫", "애완",
         ],
-    }
-    
-    # 타입별 키워드
-    TYPE_KEYWORDS = {
-        CommitmentType.ALLOWANCE.value: [
-            "가능합니다", "해드릴게요", "괜찮습니다", "허용",
-            "가능해요", "드릴게요", "됩니다",
+        CommitmentTopic.GUEST_COUNT_CHANGE.value: [
+            "인원", "명", "추가 인원", "성인", "아이",
         ],
-        CommitmentType.PROHIBITION.value: [
-            "불가합니다", "어렵습니다", "안됩니다", "금지",
-            "불가해요", "어려워요", "안돼요",
-        ],
-        CommitmentType.FEE.value: [
-            "원", "만원", "비용", "요금",
-        ],
-        CommitmentType.CONDITION.value: [
-            "경우에", "때만", "조건으로", "하시면",
+        CommitmentTopic.SPECIAL_REQUEST.value: [
+            "요청", "부탁", "준비", "수건", "베개", "이불",
         ],
     }
     
@@ -343,16 +401,28 @@ class RuleBasedCommitmentExtractor:
         sentences = self._split_sentences(sent_text)
         
         for sentence in sentences:
-            topic = self._detect_topic(sentence)
-            type_ = self._detect_type(sentence)
+            # 행동 약속 먼저 체크
+            if self._has_action_promise(sentence):
+                topic = self._detect_topic(sentence) or CommitmentTopic.OTHER.value
+                candidates.append(CommitmentCandidate(
+                    topic=topic,
+                    type=CommitmentType.ALLOWANCE.value,
+                    value={"description": sentence.strip()},
+                    provenance_text=sentence.strip(),
+                    confidence=0.5,
+                ))
+                continue
             
-            if topic and type_:
+            # 허용/금지 체크
+            type_ = self._detect_type(sentence)
+            if type_:
+                topic = self._detect_topic(sentence) or CommitmentTopic.OTHER.value
                 candidates.append(CommitmentCandidate(
                     topic=topic,
                     type=type_,
-                    value={},
+                    value={"description": sentence.strip()},
                     provenance_text=sentence.strip(),
-                    confidence=0.5,  # 규칙 기반은 낮은 신뢰도
+                    confidence=0.5,
                 ))
         
         return candidates
@@ -360,9 +430,12 @@ class RuleBasedCommitmentExtractor:
     def _split_sentences(self, text: str) -> List[str]:
         """문장 분리"""
         import re
-        # 마침표, 느낌표, 물음표로 분리
         sentences = re.split(r'[.!?]\s*', text)
         return [s.strip() for s in sentences if s.strip()]
+    
+    def _has_action_promise(self, sentence: str) -> bool:
+        """행동 약속 키워드 포함 여부"""
+        return any(kw in sentence for kw in self.ACTION_KEYWORDS)
     
     def _detect_topic(self, sentence: str) -> Optional[str]:
         """토픽 감지"""
@@ -372,8 +445,9 @@ class RuleBasedCommitmentExtractor:
         return None
     
     def _detect_type(self, sentence: str) -> Optional[str]:
-        """타입 감지"""
-        for type_, keywords in self.TYPE_KEYWORDS.items():
-            if any(kw in sentence for kw in keywords):
-                return type_
+        """타입 감지 (허용/금지)"""
+        if any(kw in sentence for kw in self.PROHIBITION_KEYWORDS):
+            return CommitmentType.PROHIBITION.value
+        if any(kw in sentence for kw in self.ALLOWANCE_KEYWORDS):
+            return CommitmentType.ALLOWANCE.value
         return None

@@ -51,15 +51,34 @@ class OCExtractor:
 
 ## Topic 종류
 - early_checkin: 얼리체크인 관련 약속
+- late_checkout: 레이트체크아웃 관련 약속
 - follow_up: "확인 후 안내드리겠습니다" 등 후속 연락 약속
-- facility_issue: 시설 문제 해결 약속
+- facility_issue: 시설 문제 해결 약속 (고장, 수리, 점검 등)
 - refund_check: 환불 관련 약속 (민감)
 - payment: 결제 관련 약속 (민감)
 - compensation: 보상 관련 약속 (민감)
 
-## target_time_type
-- explicit: 명확한 시점이 있음 (예: "체크인 당일", "내일까지", "3시에")
-- implicit: 시점이 불명확함 (예: "확인 후", "조치 후")
+## target_time_type & target_date
+- explicit: 명확한 시점이 있음 → target_date 필수
+- implicit: 시점이 불명확함 → target_date = null
+
+**날짜 변환 규칙 (오늘 날짜가 주어짐):**
+- "오늘" → 오늘 날짜
+- "내일" → 오늘 + 1일
+- "모레" → 오늘 + 2일
+- "체크인 당일" → 게스트 체크인 날짜
+- "외출 시", "확인 후" → implicit (날짜 불명확)
+
+## description 작성 규칙 (중요!)
+**구체적인 문제/상황을 포함해서 작성하세요.**
+
+❌ 나쁜 예: "시설 문제 조치 예정"
+✅ 좋은 예: "샤워기 물 두갈래 문제 - 내일 외출 시 조치"
+
+❌ 나쁜 예: "확인 후 안내 예정"
+✅ 좋은 예: "얼리체크인 가능 여부 확인 후 안내"
+
+**대화 맥락이 주어지면, 게스트가 요청한 내용을 description에 포함하세요.**
 
 ## 출력 형식
 JSON 배열로 반환합니다. 약속이 없으면 빈 배열 []을 반환합니다.
@@ -67,20 +86,20 @@ JSON 배열로 반환합니다. 약속이 없으면 빈 배열 []을 반환합�
 ```json
 [
   {
-    "topic": "early_checkin",
-    "description": "14시 얼리체크인 허용",
-    "evidence_quote": "14시에 입실 가능합니다",
+    "topic": "facility_issue",
+    "description": "샤워기 물 두갈래 문제 - 내일 외출 시 조치",
+    "evidence_quote": "외출 이후에 방문하여 조치하도록 하겠습니다",
     "target_time_type": "explicit",
-    "target_date": "2024-12-20",
-    "confidence": 0.95
+    "target_date": "2024-12-24",
+    "confidence": 0.9
   }
 ]
 ```
 
 ## 규칙
 1. evidence_quote는 원문에서 그대로 인용 (최대 100자)
-2. description은 간결하게 요약 (20자 내외)
-3. target_date는 explicit일 때만, YYYY-MM-DD 형식
+2. description은 구체적으로 작성 (50자 내외, 문제 + 조치 내용 포함)
+3. target_date는 YYYY-MM-DD 형식, 날짜가 명확할 때만
 4. confidence는 0.0~1.0 사이 (0.7 이상만 유효)
 5. 일반적인 인사/감사/안내는 추출 대상 아님
 6. 불확실하면 추출하지 않음"""
@@ -125,8 +144,11 @@ JSON 배열로 반환합니다. 약속이 없으면 빈 배열 []을 반환합�
         context: Optional[str],
     ) -> List[OCCandidate]:
         """LLM으로 추출"""
+        today = date.today()
+        
         user_content = f"""다음 호스트 메시지에서 운영 약속을 추출하세요.
 
+[오늘 날짜]: {today.isoformat()}
 [호스트 메시지]
 {sent_text}
 """
@@ -134,7 +156,7 @@ JSON 배열로 반환합니다. 약속이 없으면 빈 배열 []을 반환합�
             user_content += f"\n[게스트 체크인 날짜]: {guest_checkin_date.isoformat()}"
         
         if context:
-            user_content += f"\n[대화 맥락]\n{context}"
+            user_content += f"\n[대화 맥락 - 게스트가 요청한 내용 파악에 활용]\n{context}"
         
         response = await self._llm_client.chat_completion(
             messages=[
@@ -213,8 +235,23 @@ JSON 배열로 반환합니다. 약속이 없으면 빈 배열 []을 반환합�
         
         LLM 실패 시 또는 테스트용
         """
+        from datetime import timedelta
+        
         candidates = []
         text_lower = sent_text.lower()
+        today = date.today()
+        
+        # 날짜 파싱 헬퍼
+        def parse_relative_date(text: str) -> Optional[date]:
+            if '오늘' in text:
+                return today
+            elif '내일' in text:
+                return today + timedelta(days=1)
+            elif '모레' in text:
+                return today + timedelta(days=2)
+            elif '체크인' in text and guest_checkin_date:
+                return guest_checkin_date
+            return None
         
         # 얼리체크인 패턴
         early_checkin_patterns = [
@@ -268,18 +305,24 @@ JSON 배열로 반환합니다. 약속이 없으면 빈 배열 []을 반환합�
             r'고쳐.*드리겠',
             r'조치.*하겠',
             r'해결.*해.*드리겠',
+            r'점검.*하겠',
+            r'고정.*하겠',
         ]
         
         for pattern in facility_patterns:
             match = re.search(pattern, sent_text)
             if match:
+                # 날짜 파싱 시도
+                target_date = parse_relative_date(sent_text)
+                time_type = OCTargetTimeType.explicit.value if target_date else OCTargetTimeType.implicit.value
+                
                 candidates.append(OCCandidate(
                     topic=OCTopic.facility_issue.value,
                     description="시설 문제 조치 예정",
                     evidence_quote=match.group(0)[:100],
                     confidence=0.75,
-                    target_time_type=OCTargetTimeType.implicit.value,
-                    target_date=None,
+                    target_time_type=time_type,
+                    target_date=target_date,
                 ))
                 break
         

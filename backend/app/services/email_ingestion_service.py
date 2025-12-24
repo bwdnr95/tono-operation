@@ -21,10 +21,6 @@ from app.domain.models.conversation import ConversationChannel
 from app.domain.models.reservation_info import ReservationStatus
 from app.services.conversation_thread_service import ConversationService
 
-from app.domain.intents import (
-    MessageActor,
-    MessageActionability,
-)
 from app.services.airbnb_message_origin_classifier import (
     classify_airbnb_message_origin,
 )
@@ -57,6 +53,8 @@ def _save_reservation_info(
     - 있으면 UPDATE, 없으면 INSERT
     - airbnb_thread_id는 메일에서 파싱한 실제 값 사용 (없으면 fallback)
     - status는 confirmed (CSV 수기 입력과 구분)
+    
+    v6: LLM 기반 파싱 - LLM 결과 우선, 정규식은 fallback
     """
     repo = ReservationInfoRepository(db)
     reservation_code = getattr(parsed, "reservation_code", None)
@@ -68,6 +66,92 @@ def _save_reservation_info(
         )
         return
     
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # LLM 기반 파싱 (예약 확정 메일은 LLM 우선)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    # 정규식 결과 (fallback용)
+    regex_guest_name = getattr(parsed, "guest_name", None)
+    regex_checkin_date = getattr(parsed, "checkin_date", None)
+    regex_checkout_date = getattr(parsed, "checkout_date", None)
+    regex_guest_count = getattr(parsed, "guest_count", None)
+    
+    # LLM 파싱 시도
+    guest_name = None
+    checkin_date = None
+    checkout_date = None
+    guest_count = None
+    
+    try:
+        from app.services.airbnb_email_parser import parse_booking_confirmation_sync
+        
+        text_body = getattr(parsed, "decoded_text_body", None)
+        html_body = getattr(parsed, "decoded_html_body", None)
+        subject = getattr(parsed, "subject", None)
+        
+        llm_result = parse_booking_confirmation_sync(
+            text_body=text_body,
+            html_body=html_body,
+            subject=subject,
+        )
+        
+        # LLM 결과 사용 (있으면)
+        if llm_result.guest_name:
+            guest_name = llm_result.guest_name
+            logger.info(
+                "LLM parsed guest_name: %s (reservation_code=%s)",
+                guest_name,
+                reservation_code,
+            )
+        
+        if llm_result.checkin_date:
+            checkin_date = llm_result.checkin_date
+            logger.info(
+                "LLM parsed checkin_date: %s (reservation_code=%s)",
+                checkin_date,
+                reservation_code,
+            )
+        
+        if llm_result.checkout_date:
+            checkout_date = llm_result.checkout_date
+            logger.info(
+                "LLM parsed checkout_date: %s (reservation_code=%s)",
+                checkout_date,
+                reservation_code,
+            )
+        
+        if llm_result.guest_count:
+            guest_count = llm_result.guest_count
+            
+    except Exception as e:
+        logger.warning(
+            "LLM parsing failed: %s (reservation_code=%s)",
+            str(e),
+            reservation_code,
+        )
+    
+    # LLM 결과 없으면 정규식 결과로 fallback
+    if not guest_name:
+        guest_name = regex_guest_name
+    if not checkin_date:
+        checkin_date = regex_checkin_date
+    if not checkout_date:
+        checkout_date = regex_checkout_date
+    if not guest_count:
+        guest_count = regex_guest_count
+    
+    logger.info(
+        "Final parsed values: guest_name=%s, checkin=%s, checkout=%s (reservation_code=%s)",
+        guest_name,
+        checkin_date,
+        checkout_date,
+        reservation_code,
+    )
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # reservation_info 저장
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
     # reservation_code로 기존 레코드 조회
     existing = repo.get_by_reservation_code(reservation_code)
     
@@ -75,13 +159,13 @@ def _save_reservation_info(
         # 기존 레코드 UPDATE (airbnb_thread_id는 유지)
         repo.update(
             existing,
-            guest_name=getattr(parsed, "guest_name", None),
-            guest_count=getattr(parsed, "guest_count", None),
+            guest_name=guest_name,
+            guest_count=guest_count,
             child_count=getattr(parsed, "child_count", None),
             infant_count=getattr(parsed, "infant_count", None),
             pet_count=getattr(parsed, "pet_count", None),
-            checkin_date=getattr(parsed, "checkin_date", None),
-            checkout_date=getattr(parsed, "checkout_date", None),
+            checkin_date=checkin_date,
+            checkout_date=checkout_date,
             checkin_time=_parse_time_string(getattr(parsed, "checkin_time", None)),
             checkout_time=_parse_time_string(getattr(parsed, "checkout_time", None)),
             property_code=getattr(parsed, "property_code", None),
@@ -106,14 +190,14 @@ def _save_reservation_info(
         
         repo.create(
             airbnb_thread_id=airbnb_thread_id,
-            guest_name=getattr(parsed, "guest_name", None),
-            guest_count=getattr(parsed, "guest_count", None),
+            guest_name=guest_name,
+            guest_count=guest_count,
             child_count=getattr(parsed, "child_count", None),
             infant_count=getattr(parsed, "infant_count", None),
             pet_count=getattr(parsed, "pet_count", None),
             reservation_code=reservation_code,
-            checkin_date=getattr(parsed, "checkin_date", None),
-            checkout_date=getattr(parsed, "checkout_date", None),
+            checkin_date=checkin_date,
+            checkout_date=checkout_date,
             checkin_time=_parse_time_string(getattr(parsed, "checkin_time", None)),
             checkout_time=_parse_time_string(getattr(parsed, "checkout_time", None)),
             property_code=getattr(parsed, "property_code", None),
@@ -126,9 +210,11 @@ def _save_reservation_info(
             gmail_message_id=gmail_message_id,
         )
         logger.info(
-            "Created reservation_info: reservation_code=%s, airbnb_thread_id=%s",
+            "Created reservation_info: reservation_code=%s, airbnb_thread_id=%s, guest_name=%s, checkin=%s",
             reservation_code,
             airbnb_thread_id,
+            guest_name,
+            checkin_date,
         )
 
 
@@ -149,7 +235,6 @@ def _handle_booking_inquiry(
     """
     from app.services.conversation_thread_service import ConversationService
     from app.domain.models.conversation import ConversationChannel
-    from app.services.airbnb_origin_classifier import classify_airbnb_message_origin
     from app.services.airbnb_guest_message_extractor import extract_guest_message_segment
     
     # 중복 체크

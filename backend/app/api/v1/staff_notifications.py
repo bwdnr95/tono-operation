@@ -91,6 +91,8 @@ class StaffNotificationDTO(BaseModel):
     guest_name: Optional[str]
     checkin_date: Optional[str]
     checkout_date: Optional[str]
+    property_code: Optional[str]      # 🆕 숙소 코드
+    property_name: Optional[str]      # 🆕 숙소명
     status: str
     resolution_reason: Optional[str]
     resolution_evidence: Optional[str]  # 해소 제안 근거 (게스트 메시지)
@@ -158,6 +160,8 @@ def get_staff_notifications(
                 guest_name=item.guest_name,
                 checkin_date=item.checkin_date.isoformat() if item.checkin_date else None,
                 checkout_date=item.checkout_date.isoformat() if item.checkout_date else None,
+                property_code=item.property_code,
+                property_name=item.property_name,
                 status=item.status,
                 resolution_reason=item.resolution_reason,
                 resolution_evidence=item.resolution_evidence,

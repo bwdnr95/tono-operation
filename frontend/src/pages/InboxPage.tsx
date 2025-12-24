@@ -1,7 +1,7 @@
 // src/pages/InboxPage.tsx
 import React from "react";
 import { bulkSend } from "../api/conversations";
-import type { ConversationDetailDTO, ConversationListItemDTO } from "../types/conversations";
+import type { ConversationDetailDTO } from "../types/conversations";
 import type { RiskSignalDTO, ConflictDTO } from "../types/commitments";
 import { ConversationDetail } from "../components/conversations/ConversationDetail";
 import { canBulkSend } from "../components/conversations/OutcomeLabelDisplay";

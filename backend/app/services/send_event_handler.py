@@ -131,6 +131,7 @@ class SendEventHandler:
                 message_id=message_id,
                 guest_checkin_date=guest_checkin_date,
                 commitment_id=commitments[0].id if commitments else None,
+                conversation_context=conversation_context,
             )
             
             logger.info(
