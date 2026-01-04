@@ -172,9 +172,10 @@ class DraftService:
         safety: SafetyStatus,
         outcome_label: Optional[Dict[str, Any]] = None,
         is_user_edit: bool = False,  # ✅ v4 추가: 사용자 수정 여부
+        guest_message_snapshot: Optional[str] = None,  # ✅ v5 추가: 게스트 메시지 스냅샷
     ) -> DraftReply:
         """
-        Draft를 생성하거나 최신 Draft를 업데이트 (v4)
+        Draft를 생성하거나 최신 Draft를 업데이트 (v5)
         
         Args:
             conversation: 연결된 Conversation
@@ -182,6 +183,7 @@ class DraftService:
             safety: Safety 상태
             outcome_label: Outcome Label 4축 + 근거 (선택)
             is_user_edit: True면 사용자 수정으로 처리 (수정 이력 기록)
+            guest_message_snapshot: Draft 생성 시점의 게스트 메시지 (Learning Agent용)
         """
         latest = self.db.execute(
             select(DraftReply)
@@ -200,6 +202,7 @@ class DraftService:
                 is_edited=False,
                 safety_status=safety,
                 outcome_label=outcome_label,
+                guest_message_snapshot=guest_message_snapshot,  # ✅ v5: 스냅샷 저장
             )
             self.db.add(dr)
             self.db.flush()
@@ -225,6 +228,9 @@ class DraftService:
             latest.original_content = content
             latest.is_edited = False
             latest.human_override = None
+            # ✅ v5: 게스트 메시지 스냅샷도 갱신 (새 메시지에 대한 재생성이므로)
+            if guest_message_snapshot:
+                latest.guest_message_snapshot = guest_message_snapshot
         
         latest.content = content
         latest.airbnb_thread_id = conversation.airbnb_thread_id

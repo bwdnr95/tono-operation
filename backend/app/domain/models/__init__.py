@@ -12,9 +12,24 @@ from .staff_notification_record import StaffNotificationRecord
 from .staff_notification import StaffNotification
 from .reservation_info import ReservationInfo, ReservationStatus
 from .alteration_request import AlterationRequest, AlterationStatus
-
+from .ical_blocked_date import IcalBlockedDate
+from .notification import Notification, NotificationType
+from .push_subscription import PushSubscription
+from .complaint import Complaint, ComplaintCategory, ComplaintSeverity, ComplaintStatus
 # v1.3 THREAD-BASED Conversation models
 from .conversation import Conversation, DraftReply, SendActionLog
+
+# v2.0 Orchestrator models
+from .orchestrator import (
+    Decision,
+    ReasonCode,
+    HumanAction,
+    AutomationEligibility,
+    DecisionLog,
+    AutomationPattern,
+    PolicyRule,
+)
+
 
 __all__ = [
     "Base",
@@ -30,7 +45,24 @@ __all__ = [
     "ReservationStatus",
     "AlterationRequest",
     "AlterationStatus",
+    "IcalBlockedDate",
     "Conversation",
     "DraftReply",
     "SendActionLog",
+    "Notification",
+    "NotificationType",
+    "PushSubscription",
+    "Complaint",
+    "ComplaintCategory",
+    "ComplaintSeverity",
+    "ComplaintStatus",
+    "AnswerEmbedding",
+    # Orchestrator models
+    "Decision",
+    "ReasonCode",
+    "HumanAction",
+    "AutomationEligibility",
+    "DecisionLog",
+    "AutomationPattern",
+    "PolicyRule",
 ]

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import date
 from typing import List, Optional
 
 from pydantic import BaseModel, ValidationError
@@ -34,12 +35,18 @@ class CommitmentCandidate:
     
     이 구조체는 "확정되지 않은 후보"임을 명확히 한다.
     CommitmentService가 검증 후 Commitment로 변환한다.
+    
+    OC 생성 조건:
+    - type이 "action_promise"인 경우
+    - 또는 topic이 민감 토픽(refund, payment, compensation)인 경우
     """
     topic: str                    # CommitmentTopic 값
     type: str                     # CommitmentType 값
     value: dict                   # 구조화된 값
     provenance_text: str          # 근거 문장
     confidence: float             # 추출 신뢰도 (0~1)
+    target_date: Optional[str] = None      # 🆕 이행 목표일 (YYYY-MM-DD)
+    target_time_type: str = "implicit"     # 🆕 "explicit" | "implicit"
 
 
 class LLMExtractionResponse(BaseModel):
@@ -71,14 +78,21 @@ class CommitmentExtractor:
     ALLOWED_TOPICS = [t.value for t in CommitmentTopic]
     ALLOWED_TYPES = [t.value for t in CommitmentType]
     
-    def __init__(self) -> None:
-        self._api_key = settings.LLM_API_KEY
-        self._model = settings.LLM_MODEL or "gpt-4.1-mini"
+    def __init__(self, openai_client=None, model: str = None) -> None:
+        """
+        Args:
+            openai_client: OpenAI 클라이언트 인스턴스 (DI)
+            model: 사용할 모델 (기본값: settings.LLM_MODEL_PARSER)
+        """
+        self._client = openai_client
+        # 단순 추출용 모델 (비용 절감)
+        self._model = model or settings.LLM_MODEL_PARSER or "gpt-4o-mini"
     
     async def extract(
         self,
         sent_text: str,
         conversation_context: Optional[str] = None,
+        guest_checkin_date: Optional[date] = None,
     ) -> List[CommitmentCandidate]:
         """
         발송된 답변에서 Commitment 후보 추출
@@ -86,11 +100,12 @@ class CommitmentExtractor:
         Args:
             sent_text: 발송된 답변 원문
             conversation_context: 대화 맥락 (있으면 정확도 향상)
+            guest_checkin_date: 게스트 체크인 날짜 (날짜 파싱 정확도 향상)
         
         Returns:
             CommitmentCandidate 리스트 (빈 리스트 가능)
         """
-        if not self._api_key:
+        if not self._client:
             logger.warning("COMMITMENT_EXTRACTOR: LLM API key not set, skipping extraction")
             return []
         
@@ -98,7 +113,7 @@ class CommitmentExtractor:
             return []
         
         try:
-            raw_response = await self._call_llm(sent_text, conversation_context)
+            raw_response = await self._call_llm(sent_text, conversation_context, guest_checkin_date)
             candidates = self._parse_response(raw_response)
             return candidates
         except Exception as e:
@@ -109,16 +124,17 @@ class CommitmentExtractor:
         self,
         sent_text: str,
         conversation_context: Optional[str],
+        guest_checkin_date: Optional[date] = None,
     ) -> str:
         """LLM API 호출"""
-        from openai import OpenAI
-        
-        client = OpenAI(api_key=self._api_key)
+        if not self._client:
+            logger.warning("COMMITMENT_EXTRACTOR: No OpenAI client available")
+            return "[]"
         
         system_prompt = self._build_system_prompt()
-        user_prompt = self._build_user_prompt(sent_text, conversation_context)
+        user_prompt = self._build_user_prompt(sent_text, conversation_context, guest_checkin_date)
         
-        response = client.chat.completions.create(
+        response = self._client.chat.completions.create(
             model=self._model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -140,37 +156,85 @@ class CommitmentExtractor:
 호스트가 게스트에게 한 **구속력 있는 언급**입니다.
 핵심 판단 기준: "호스트가 이것을 지키지 않으면 게스트가 불만을 가질 수 있는가?"
 
-### 약속의 유형
-1. **허용/금지**: 게스트의 요청에 대한 가부 결정
-2. **행동 약속**: 호스트가 하겠다고 한 행동
-3. **요금/조건**: 금액이나 조건에 대한 확정
-4. **변경 확정**: 예약 내용 변경 확정
+## type (유형) - 가장 중요!
 
-## 판단 시 고려사항
+### allowance (허용)
+- "가능합니다", "괜찮습니다", "해드릴 수 있습니다"
+- 게스트의 요청을 수락하는 경우
 
-### 대화 맥락이 중요합니다
-- 게스트가 무엇을 물었는지 파악하세요
-- "네 가능합니다"만 보면 모호하지만, 게스트 질문과 함께 보면 명확해집니다
-- 맥락 없이는 판단이 어려우면 confidence를 낮추세요
+### prohibition (금지)
+- "불가합니다", "어렵습니다", "안 됩니다"
+- 게스트의 요청을 거절하는 경우
 
-### 약속으로 볼 수 있는 것 (예시)
-- "얼리체크인 가능합니다" → 허용 약속
-- "당일에 연락드리겠습니다" → 행동 약속
-- "추가 요금 없이 해드릴게요" → 요금 확정
-- "확인 후 다시 안내드리겠습니다" → 행동 약속
-- "수건 추가로 준비해드릴게요" → 행동 약속
-- "반려동물은 어렵습니다" → 금지
+### action_promise (행동 약속) ⭐️ 중요!
+- "~하겠습니다", "~해드리겠습니다", "~드릴게요", "~할게요"
+- 호스트/운영팀이 **물리적 행동**을 해야 하는 경우
+- 예시:
+  - "방문하여 조치하겠습니다" → action_promise
+  - "확인 후 연락드리겠습니다" → action_promise
+  - "수건 추가로 준비해드릴게요" → action_promise
+  - "내일 기사님이 방문합니다" → action_promise
 
-### 약속이 아닌 것 (예시)
-- "체크인 시간은 15시입니다" → 고정된 숙소 정보 (변하지 않는 사실)
-- "감사합니다" → 인사
-- "궁금한 점 있으시면 말씀해주세요" → 일반적 안내
-- "좋은 하루 되세요" → 인사
+### fee (요금)
+- 금액 언급: "추가 요금 2만원", "무료로 해드릴게요"
 
-### 애매한 경우
-- 확실하지 않으면 추출하되 confidence를 낮게 (0.4~0.6)
-- 완전히 약속이 아닌 것만 제외하세요
-- 과소추출보다 과다추출이 낫습니다 (시스템이 나중에 필터링)
+### change (변경)
+- "날짜를 변경해드렸습니다", "인원을 수정했습니다"
+
+### condition (조건부)
+- "~하시면 가능합니다", "~경우에만 됩니다"
+
+## topic (주제)
+
+### 체크인/체크아웃
+- early_checkin: 얼리체크인
+- late_checkout: 레이트체크아웃  
+- checkin_time: 체크인 시간 확정
+- checkout_time: 체크아웃 시간 확정
+
+### 예약/인원
+- guest_count_change: 인원 변경
+- reservation_change: 예약 날짜 변경
+
+### 제공/요금
+- free_provision: 무료 제공
+- extra_fee: 추가 요금
+- amenity_request: 어메니티/수건 준비
+
+### 운영 관련
+- facility_issue: 시설 문제 조치 (고장, 수리, 점검)
+- follow_up: 확인 후 연락 약속
+- visit_schedule: 방문 일정 약속
+
+### 민감 토픽
+- refund: 환불 관련
+- payment: 결제 관련
+- compensation: 보상 관련
+
+### 기타
+- pet_policy: 반려동물 정책
+- special_request: 특별 요청
+- other: 분류 불가
+
+## target_time_type & target_date (행동 약속일 때만)
+
+type이 action_promise인 경우, 이행 시점을 파악하세요:
+
+- **explicit**: 명확한 시점이 있음
+  - "내일 방문하겠습니다" → explicit, target_date 필수
+  - "오늘 중으로 연락드리겠습니다" → explicit
+  - "체크인 당일 준비해두겠습니다" → explicit (게스트 체크인 날짜)
+
+- **implicit**: 시점이 불명확함
+  - "확인 후 연락드리겠습니다" → implicit (언제인지 모름)
+  - "방문하여 조치하겠습니다" → implicit (날짜 미정)
+  - "최대한 빠르게" → implicit
+
+**날짜 변환 (오늘 기준):**
+- "오늘" → 오늘 날짜
+- "내일" → 오늘 + 1일
+- "모레" → 오늘 + 2일
+- 날짜 모르면 target_date는 null
 
 ## 출력 형식
 
@@ -180,47 +244,50 @@ JSON으로만 응답하세요:
 {{
   "commitments": [
     {{
-      "topic": "토픽",
-      "type": "유형",
-      "value": {{"description": "구체적 내용", ...}},
-      "provenance_text": "근거가 된 원문 문장 (정확히 복사)",
-      "confidence": 0.0 ~ 1.0
+      "topic": "facility_issue",
+      "type": "action_promise",
+      "value": {{"description": "샤워기 문제 방문 조치"}},
+      "provenance_text": "방문하여 조치하겠습니다",
+      "confidence": 0.9,
+      "target_time_type": "implicit",
+      "target_date": null
     }}
   ]
 }}
 ```
 
-### topic 값 (가장 적합한 것 선택, 없으면 "other")
-{self.ALLOWED_TOPICS}
-
-### type 값
-{self.ALLOWED_TYPES}
-
-### value 필드 (해당하는 것만 포함)
-- "allowed": true/false (허용/금지인 경우)
-- "time": "HH:MM" (시간 관련인 경우)
-- "amount": 숫자 (금액인 경우)
-- "description": "구체적 설명" (항상 포함 권장)
-
-### confidence 가이드
-- 0.9+: 명확한 약속 ("네, 가능합니다", "해드리겠습니다")
-- 0.7~0.9: 높은 확신 (문맥상 약속으로 보임)
-- 0.5~0.7: 중간 확신 (약속일 수도 있음)
-- 0.5 미만: 낮은 확신 (애매하지만 일단 추출)
-
 ## 주의사항
-- 약속이 없으면 빈 배열: {{"commitments": []}}
+- 약속이 없으면: {{"commitments": []}}
 - provenance_text는 원문에서 **정확히** 복사
 - 하나의 문장에 여러 약속이 있으면 각각 분리
-- 대화 맥락이 없으면 답변만으로 판단하되 confidence 낮춤"""
+- 인사, 감사, 일반 안내는 약속이 아님
+- action_promise와 allowance 구분: "해드릴 수 있습니다"(allowance) vs "해드리겠습니다"(action_promise)"""
 
     def _build_user_prompt(
         self,
         sent_text: str,
         conversation_context: Optional[str],
+        guest_checkin_date: Optional[date] = None,
     ) -> str:
         """사용자 프롬프트 생성"""
         parts = []
+        
+        # 날짜 컨텍스트 (매우 중요!)
+        today = date.today()
+        parts.append(f"## 날짜 정보 (필수 참고)")
+        parts.append(f"- 오늘 날짜: {today.strftime('%Y-%m-%d')} ({today.year}년 {today.month}월 {today.day}일)")
+        if guest_checkin_date:
+            parts.append(f"- 게스트 체크인: {guest_checkin_date.strftime('%Y-%m-%d')} ({guest_checkin_date.year}년 {guest_checkin_date.month}월 {guest_checkin_date.day}일)")
+            parts.append(f"\n**날짜 해석 규칙:**")
+            parts.append(f"- \"9일\", \"9일에\" 등 날짜만 언급 → 체크인 달({guest_checkin_date.month}월)의 해당 일 → {guest_checkin_date.year}-{guest_checkin_date.month:02d}-09")
+            parts.append(f"- \"내일\", \"오늘\" → 오늘({today}) 기준으로 계산")
+            parts.append(f"- \"체크인 당일\" → {guest_checkin_date.strftime('%Y-%m-%d')}")
+        else:
+            parts.append(f"- 게스트 체크인: (알 수 없음)")
+            parts.append(f"\n**날짜 해석 규칙:**")
+            parts.append(f"- 연도 없이 날짜만 언급 시 → {today.year}년 기준")
+            parts.append(f"- 현재 월보다 이전 달이면 → 다음 해({today.year + 1}년)")
+        parts.append("")
         
         if conversation_context:
             parts.append(f"## 대화 맥락\n{conversation_context}\n")
@@ -295,6 +362,8 @@ JSON으로만 응답하세요:
         value = item.get("value", {})
         provenance_text = item.get("provenance_text", "")
         confidence = item.get("confidence", 0.5)
+        target_date = item.get("target_date")  # 🆕
+        target_time_type = item.get("target_time_type", "implicit")  # 🆕
         
         # 필수 필드 검증
         if not topic or not type_ or not provenance_text:
@@ -304,7 +373,7 @@ JSON으로만 응답하세요:
         if topic not in self.ALLOWED_TOPICS:
             topic = CommitmentTopic.OTHER.value
         
-        # type 유효성 검증 - 없으면 other로 (유연하게, 기존은 무시했음)
+        # type 유효성 검증 - 없으면 allowance로 (유연하게)
         if type_ not in self.ALLOWED_TYPES:
             # 유사한 type 매핑 시도
             type_mapping = {
@@ -316,6 +385,8 @@ JSON으로만 응답하세요:
                 "cost": "fee",
                 "modify": "change",
                 "update": "change",
+                "action": "action_promise",
+                "promise": "action_promise",
             }
             type_ = type_mapping.get(type_, "allowance")  # 기본값 allowance
         
@@ -326,12 +397,27 @@ JSON으로만 응답하세요:
         if not isinstance(value, dict):
             value = {"description": str(value)}
         
+        # target_time_type 유효성 검증
+        if target_time_type not in ("explicit", "implicit"):
+            target_time_type = "implicit"
+        
+        # target_date 유효성 검증 (YYYY-MM-DD 형식)
+        if target_date:
+            try:
+                from datetime import datetime
+                datetime.strptime(target_date, "%Y-%m-%d")
+            except (ValueError, TypeError):
+                target_date = None
+                target_time_type = "implicit"
+        
         return CommitmentCandidate(
             topic=topic,
             type=type_,
             value=value,
             provenance_text=provenance_text,
             confidence=confidence,
+            target_date=target_date,
+            target_time_type=target_time_type,
         )
 
 

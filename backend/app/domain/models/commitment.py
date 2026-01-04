@@ -35,40 +35,90 @@ class CommitmentTopic(str, Enum):
     """
     Commitment의 주제 분류
     
-    MVP에서 지원하는 토픽:
-    - 체크인/체크아웃 시간 관련
-    - 인원 변경
-    - 무료 제공 / 추가 요금
-    - 예약 변경
+    카테고리:
+    1. 체크인/체크아웃 관련
+    2. 예약/인원 변경
+    3. 제공/요금 관련
+    4. 정책 관련
+    5. 운영 관련 (OC 생성 대상)
+    6. 민감 토픽 (OC 생성 + 운영자 확인 필요)
     """
+    # ── 체크인/체크아웃 ──
     EARLY_CHECKIN = "early_checkin"           # 얼리 체크인 허용/불가
     LATE_CHECKOUT = "late_checkout"           # 레이트 체크아웃 허용/불가
     CHECKIN_TIME = "checkin_time"             # 체크인 시간 확정
     CHECKOUT_TIME = "checkout_time"           # 체크아웃 시간 확정
+    
+    # ── 예약/인원 ──
     GUEST_COUNT_CHANGE = "guest_count_change" # 인원 변경
+    RESERVATION_CHANGE = "reservation_change" # 날짜 변경 등
+    
+    # ── 제공/요금 ──
     FREE_PROVISION = "free_provision"         # 무료 제공 (수건, 어메니티 등)
     EXTRA_FEE = "extra_fee"                   # 추가 요금 고지
-    RESERVATION_CHANGE = "reservation_change" # 날짜 변경 등
+    AMENITY_REQUEST = "amenity_request"       # 어메니티/수건 등 준비 요청
+    
+    # ── 정책 ──
     PET_POLICY = "pet_policy"                 # 반려동물 관련 약속
+    
+    # ── 운영 관련 (OC 생성 대상) ──
+    ISSUE_RESOLUTION = "issue_resolution"     # 🆕 문제 해결 약속 (수리, 조치 등)
+    FOLLOW_UP = "follow_up"                   # 확인 후 연락 약속
+    VISIT_SCHEDULE = "visit_schedule"         # 방문 일정 약속
+    
+    # ── 민감 토픽 (OC 생성 + 운영자 확인 필요) ──
+    REFUND = "refund"                         # 환불 관련
+    PAYMENT = "payment"                       # 결제 관련
+    COMPENSATION = "compensation"             # 보상 관련
+    
+    # ── 기타 ──
     SPECIAL_REQUEST = "special_request"       # 기타 특별 요청
     OTHER = "other"                           # 분류 불가
+    
+    @classmethod
+    def oc_required_topics(cls) -> set:
+        """OC 생성이 필요한 토픽 (action_promise 타입일 때)"""
+        return {
+            cls.EARLY_CHECKIN.value,
+            cls.LATE_CHECKOUT.value,
+            cls.AMENITY_REQUEST.value,
+            cls.ISSUE_RESOLUTION.value,  # 🆕 추가
+            cls.FOLLOW_UP.value,
+            cls.VISIT_SCHEDULE.value,
+        }
+    
+    @classmethod
+    def sensitive_topics(cls) -> set:
+        """민감 토픽 (OC 생성 + 운영자 확인 필요)"""
+        return {
+            cls.REFUND.value,
+            cls.PAYMENT.value,
+            cls.COMPENSATION.value,
+        }
 
 
 class CommitmentType(str, Enum):
     """
     Commitment의 유형
     
-    - ALLOWANCE: 허용 ("가능합니다", "해드릴게요")
+    - ALLOWANCE: 허용 ("가능합니다")
     - PROHIBITION: 금지 ("불가합니다", "어렵습니다")
+    - ACTION_PROMISE: 행동 약속 ("~하겠습니다", "~해드릴게요") → OC 생성 대상
     - FEE: 금액 관련 ("추가 요금 2만원", "무료로 제공")
     - CHANGE: 변경/조정 ("날짜를 변경해드렸습니다")
     - CONDITION: 조건부 ("~하시면 가능합니다")
     """
     ALLOWANCE = "allowance"
     PROHIBITION = "prohibition"
+    ACTION_PROMISE = "action_promise"  # 🆕 행동 약속 → OC 생성 대상
     FEE = "fee"
     CHANGE = "change"
     CONDITION = "condition"
+    
+    @classmethod
+    def oc_trigger_types(cls) -> set:
+        """OC 생성을 유발하는 타입"""
+        return {cls.ACTION_PROMISE.value}
 
 
 class CommitmentScope(str, Enum):

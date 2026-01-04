@@ -118,11 +118,12 @@ class Conversation(Base):
 
 class DraftReply(Base):
     """
-    초안 응답 (v4)
+    초안 응답 (v5)
     
     변경사항:
     - v3: outcome_label, human_override 추가
     - v4: original_content, is_edited 추가 (수정 이력 추적)
+    - v5: guest_message_snapshot 추가 (Learning Agent용)
     """
     __tablename__ = "draft_replies"
 
@@ -139,6 +140,10 @@ class DraftReply(Base):
     # ===== v4 추가: 원본 LLM 응답 보존 =====
     original_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
     is_edited: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    
+    # ===== v5 추가: 게스트 메시지 스냅샷 (Learning Agent용) =====
+    # Draft 생성 시점의 게스트 메시지를 저장하여 정확한 쌍 분석 가능
+    guest_message_snapshot: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
 
     safety_status: Mapped[SafetyStatus] = mapped_column(
         SAEnum(

@@ -113,35 +113,24 @@ class OCRepository:
         
         규칙:
         1. status = pending or suggested_resolve
-        2. explicit: target_date - 1 <= today
-        3. implicit: 즉시 노출
-        4. is_candidate_only: 확정 요청으로 노출
+        2. 모든 OC 조회 (priority는 Service 레이어에서 계산)
         """
         # 기본 조건: 활성 상태
-        base_conditions = [
+        conditions = [
             OperationalCommitment.status.in_([
                 OCStatus.pending.value,
                 OCStatus.suggested_resolve.value,
             ])
         ]
         
-        # explicit 조건: D-1부터 노출
-        # implicit 조건: 항상 노출
-        time_conditions = or_(
-            # implicit → 항상 노출
-            OperationalCommitment.target_time_type == OCTargetTimeType.implicit.value,
-            # explicit → D-1부터
-            and_(
-                OperationalCommitment.target_time_type == OCTargetTimeType.explicit.value,
-                OperationalCommitment.target_date <= today + timedelta(days=1),
-            ),
-            # candidate_only → 확정 요청으로 항상 노출
-            OperationalCommitment.is_candidate_only == True,
-        )
+        if property_code:
+            from app.domain.models.conversation import Conversation
+            # property_code 필터는 Conversation과 조인 필요
+            pass  # 현재는 전체 조회
         
         stmt = (
             select(OperationalCommitment)
-            .where(and_(*base_conditions, time_conditions))
+            .where(and_(*conditions))
             .order_by(
                 # 우선순위 정렬: target_date 오름차순 (급한 것 먼저)
                 OperationalCommitment.target_date.asc().nullsfirst(),

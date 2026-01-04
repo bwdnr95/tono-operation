@@ -42,6 +42,8 @@ from app.api.v1.schemas.conversation import (
     ConversationListItemDTO,
     ConversationListResponse,
     ConversationMessageDTO,
+    DateAvailabilityDTO,
+    DateConflictDTO,
     DraftGenerateRequest,
     DraftGenerateResponse,
     DraftPatchRequest,
@@ -133,6 +135,7 @@ def list_conversations(
             guest_name=reservation.guest_name if reservation else None,
             checkin_date=str(reservation.checkin_date) if reservation and reservation.checkin_date else None,
             checkout_date=str(reservation.checkout_date) if reservation and reservation.checkout_date else None,
+            reservation_status=reservation.status if reservation else None,
         ))
     
     return ConversationListResponse(items=items, next_cursor=next_cursor)
@@ -166,6 +169,9 @@ def mark_conversation_read(
         raise HTTPException(status_code=404, detail="Conversation not found")
     
     conv.is_read = True
+    # ✅ 처리완료 시 status도 complete로 변경 (미응답 알림 방지)
+    if conv.status == ConversationStatus.pending:
+        conv.status = ConversationStatus.complete
     conv.updated_at = datetime.utcnow()
     db.commit()
     
@@ -225,6 +231,50 @@ def get_conversation(conversation_id: UUID, db: Session = Depends(get_db)):
         .limit(20)
     ).scalars().all()
 
+    # 가장 최근 메시지의 reply_to 확인 (incoming/outgoing 구분 없이)
+    # 호스트가 보낸 메시지(outgoing)에도 reply_to가 있으므로 답장 가능
+    last_message_with_reply = db.execute(
+        select(IncomingMessage)
+        .where(
+            IncomingMessage.airbnb_thread_id == conv.airbnb_thread_id,
+            IncomingMessage.reply_to.isnot(None)
+        )
+        .order_by(desc(IncomingMessage.received_at))
+        .limit(1)
+    ).scalar_one_or_none()
+    
+    can_reply = bool(last_message_with_reply and last_message_with_reply.reply_to)
+    
+    # 에어비앤비 링크 생성 (can_reply=False일 때)
+    airbnb_action_url = None
+    if not can_reply and conv.airbnb_thread_id:
+        airbnb_action_url = f"https://www.airbnb.co.kr/hosting/inbox/folder/all/thread/{conv.airbnb_thread_id}"
+
+    # 예약 가능 여부 체크 (INQUIRY 상태이고 checkin_date가 있을 때)
+    date_availability = None
+    if reservation and reservation.status == "inquiry" and reservation.checkin_date:
+        from app.repositories.reservation_info_repository import ReservationInfoRepository
+        repo = ReservationInfoRepository(db)
+        availability_result = repo.check_date_availability(
+            property_code=reservation.property_code,
+            checkin_date=reservation.checkin_date,
+            checkout_date=reservation.checkout_date,
+            exclude_airbnb_thread_id=conv.airbnb_thread_id,
+        )
+        date_availability = DateAvailabilityDTO(
+            available=availability_result["available"],
+            conflicts=[
+                DateConflictDTO(
+                    guest_name=c["guest_name"],
+                    checkin_date=c["checkin_date"],
+                    checkout_date=c["checkout_date"],
+                    status=c["status"],
+                    reservation_code=c["reservation_code"],
+                )
+                for c in availability_result["conflicts"]
+            ],
+        )
+
     return ConversationDetailResponse(
         conversation=ConversationDTO(
             id=conv.id,
@@ -240,6 +290,7 @@ def get_conversation(conversation_id: UUID, db: Session = Depends(get_db)):
             guest_name=reservation.guest_name if reservation else None,
             checkin_date=str(reservation.checkin_date) if reservation and reservation.checkin_date else None,
             checkout_date=str(reservation.checkout_date) if reservation and reservation.checkout_date else None,
+            reservation_status=reservation.status if reservation else None,
         ),
         messages=[
             ConversationMessageDTO(
@@ -274,6 +325,9 @@ def get_conversation(conversation_id: UUID, db: Session = Depends(get_db)):
             }
             for log in logs
         ],
+        can_reply=can_reply,
+        airbnb_action_url=airbnb_action_url,
+        date_availability=date_availability,
     )
 
 
@@ -298,7 +352,9 @@ async def generate_draft(conversation_id: UUID, body: DraftGenerateRequest, db: 
     if not last_guest_msg:
         raise HTTPException(status_code=400, detail="No guest message found in thread")
 
-    auto_reply_service = AutoReplyService(db=db)
+    from app.adapters.llm_client import get_openai_client
+    openai_client = get_openai_client()
+    auto_reply_service = AutoReplyService(db=db, openai_client=openai_client)
     suggestion = await auto_reply_service.suggest_reply_for_message(
         message_id=last_guest_msg.id,
         ota=last_guest_msg.ota or "airbnb",
@@ -369,9 +425,17 @@ def patch_draft(conversation_id: UUID, body: DraftPatchRequest, db: Session = De
 async def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Depends(get_db)):
     """
     Conversation 단건 발송.
-    - Draft → Send 직행 (Preview 없음)
-    - confirm_token 없음
+    
+    Orchestrator 통합:
+    1. Draft에 대해 Decision 판단
+    2. BLOCK이면 발송 차단
+    3. REQUIRE_REVIEW면 확인 요청 (force_send=True로 우회 가능)
+    4. 발송 후 DecisionLog에 결과 기록
     """
+    from app.services.orchestrator_core import OrchestratorCore, EvidencePackage
+    from app.domain.models.orchestrator import Decision, HumanAction
+    from app.api.v1.schemas.conversation import OrchestratorWarningDTO
+    
     conv = db.execute(select(Conversation).where(Conversation.id == conversation_id)).scalar_one_or_none()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -402,6 +466,69 @@ async def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Dep
         db.add(conv)
         db.commit()
         raise HTTPException(status_code=400, detail="No incoming message found")
+
+    # ═══════════════════════════════════════════════════════════════
+    # 🆕 Orchestrator Decision 판단
+    # ═══════════════════════════════════════════════════════════════
+    orchestrator = OrchestratorCore(db)
+    
+    # 기존 Commitment 조회
+    from app.repositories.commitment_repository import CommitmentRepository
+    commitment_repo = CommitmentRepository(db)
+    active_commitments = commitment_repo.get_active_by_thread_id(conv.airbnb_thread_id)
+    
+    # Evidence 패키지 구성
+    evidence = EvidencePackage(
+        guest_message=last_incoming.pure_guest_message or "",
+        draft_content=draft.content,
+        conversation_id=conv.id,
+        airbnb_thread_id=conv.airbnb_thread_id,
+        property_code=last_incoming.property_code,
+        draft_id=draft.id,
+        active_commitments=[c.to_dict() for c in active_commitments],
+        outcome_label=draft.outcome_label,
+    )
+    
+    # Decision 판단
+    decision_result = await orchestrator.evaluate_draft(evidence)
+    
+    # BLOCK이면 발송 차단
+    if decision_result.decision == Decision.BLOCK:
+        return SendResponse(
+            conversation_id=conv.id,
+            status="blocked",
+            decision=decision_result.decision.value,
+            reason_codes=[rc.value for rc in decision_result.reason_codes],
+            warnings=[
+                OrchestratorWarningDTO(code=rc.value, message=f"차단 사유: {rc.value}", severity="error")
+                for rc in decision_result.reason_codes
+            ],
+            decision_log_id=decision_result.decision_log_id,
+        )
+    
+    # 🚧 임시 비활성화: Orchestrator requires_human 체크
+    # TODO: 프론트엔드 확인 UI 구현 후 활성화
+    # if decision_result.requires_human and not body.force_send:
+    #     return SendResponse(
+    #         conversation_id=conv.id,
+    #         status="requires_confirmation",
+    #         decision=decision_result.decision.value,
+    #         reason_codes=[rc.value for rc in decision_result.reason_codes],
+    #         warnings=[
+    #             OrchestratorWarningDTO(
+    #                 code=w, 
+    #                 message=w, 
+    #                 severity="warning"
+    #             )
+    #             for w in decision_result.warnings
+    #         ],
+    #         decision_log_id=decision_result.decision_log_id,
+    #         commitment_conflicts=decision_result.commitment_conflicts,
+    #     )
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 발송 진행
+    # ═══════════════════════════════════════════════════════════════
 
     # reply_to가 없으면 발송 불가
     if not last_incoming.reply_to:
@@ -486,6 +613,20 @@ async def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Dep
     conv.updated_at = datetime.utcnow()
     db.add(conv)
 
+    # 🆕 Human Action 기록 (Decision Log 업데이트)
+    human_action = HumanAction.APPROVED_WITH_EDIT if draft.is_edited else HumanAction.APPROVED_AS_IS
+    if decision_result.decision_log_id:
+        orchestrator.record_human_action(
+            decision_log_id=decision_result.decision_log_id,
+            action=human_action,
+            actor="staff",  # TODO: 실제 사용자 ID
+            edited_content=draft.content if draft.is_edited else None,
+        )
+        orchestrator.record_sent(
+            decision_log_id=decision_result.decision_log_id,
+            final_content=draft.content,
+        )
+
     SendLogService(db=db).log_action(
         conversation=conv, 
         action=SendAction.send, 
@@ -499,14 +640,17 @@ async def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Dep
             "safety_status": str(draft.safety_status.value),
             "is_edited": draft.is_edited,
             "original_content": draft.original_content if draft.is_edited else None,
+            # 🆕 Orchestrator 정보
+            "orchestrator_decision": decision_result.decision.value,
+            "orchestrator_reason_codes": [rc.value for rc in decision_result.reason_codes],
+            "decision_log_id": str(decision_result.decision_log_id) if decision_result.decision_log_id else None,
         }
     )
 
     db.commit()
     
-    # 🆕 Commitment + OC 추출 (발송 후 비동기 처리)
+    # 🆕 Commitment + OC + Embedding 추출 (발송 후 동기 처리 - DB 세션 유지 필요)
     try:
-        import asyncio
         send_handler = SendEventHandler(db)
         
         # 대화 맥락 생성 (최근 게스트 메시지)
@@ -514,22 +658,38 @@ async def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Dep
         if last_incoming.pure_guest_message:
             conversation_context = f"게스트 요청: {last_incoming.pure_guest_message[:500]}"
         
-        asyncio.create_task(
-            send_handler.on_message_sent(
-                sent_text=draft.content,
-                airbnb_thread_id=conv.airbnb_thread_id,
-                property_code=last_incoming.property_code or "",
-                message_id=out_msg.id,
-                conversation_id=conv.id,
-                guest_checkin_date=last_incoming.checkin_date,  # OC target_date 계산용
-                conversation_context=conversation_context,  # 🆕 대화 맥락 추가
-            )
+        # 🆕 Few-shot Learning용 게스트 메시지 (스냅샷 우선, 없으면 last_incoming)
+        guest_message_for_embedding = (
+            draft.guest_message_snapshot 
+            or last_incoming.pure_guest_message 
+            or ""
+        )
+        
+        # await로 직접 호출 (DB 세션이 열려있는 동안 완료)
+        await send_handler.on_message_sent(
+            sent_text=draft.content,
+            airbnb_thread_id=conv.airbnb_thread_id,
+            property_code=last_incoming.property_code or "",
+            message_id=out_msg.id,
+            conversation_id=conv.id,
+            guest_checkin_date=last_incoming.checkin_date,  # OC target_date 계산용
+            conversation_context=conversation_context,  # 대화 맥락 추가
+            # 🆕 Few-shot Learning용
+            guest_message=guest_message_for_embedding,
+            was_edited=draft.is_edited,
         )
     except Exception as e:
         # Commitment 추출 실패해도 발송은 성공
         logger.warning(f"Commitment extraction failed: {e}")
 
-    return SendResponse(conversation_id=conv.id, sent_at=datetime.utcnow(), status="sent")
+    return SendResponse(
+        conversation_id=conv.id, 
+        sent_at=datetime.utcnow(), 
+        status="sent",
+        decision=decision_result.decision.value,
+        reason_codes=[rc.value for rc in decision_result.reason_codes],
+        decision_log_id=decision_result.decision_log_id,
+    )
 
 
 # ============================================================
@@ -585,14 +745,20 @@ async def ingest_gmail_and_generate_drafts(
         tid = getattr(parsed, "airbnb_thread_id", None)
         if tid:
             thread_ids.add(tid)
+    
+    logger.info(f"[INGEST-GMAIL] thread_ids 추출: {len(thread_ids)}개 - {list(thread_ids)[:5]}")
 
     # 4) 각 Conversation에 대해 Draft 생성
     result_items: List[GmailIngestConversationItem] = []
-    auto_reply_service = AutoReplyService(db=db)
+    from app.adapters.llm_client import get_openai_client
+    openai_client = get_openai_client()
+    auto_reply_service = AutoReplyService(db=db, openai_client=openai_client)
     draft_service = DraftService(db)
     guard = SafetyGuardService(db)
 
     for airbnb_thread_id in thread_ids:
+        logger.info(f"[INGEST-GMAIL] 처리 중: {airbnb_thread_id}")
+        
         # Conversation 조회
         conv = db.execute(
             select(Conversation).where(
@@ -602,7 +768,10 @@ async def ingest_gmail_and_generate_drafts(
         ).scalar_one_or_none()
 
         if not conv:
+            logger.info(f"[INGEST-GMAIL] {airbnb_thread_id} → conv 없음, 스킵")
             continue
+
+        logger.info(f"[INGEST-GMAIL] {airbnb_thread_id} → conv.status={conv.status}")
 
         # ✅ 이미 처리된 conversation은 스킵 (sent, ready_to_send)
         if conv.status in [ConversationStatus.sent]:
@@ -616,6 +785,7 @@ async def ingest_gmail_and_generate_drafts(
         # ✅ 이미 draft가 있는 경우 스킵 (LLM 중복 호출 방지)
         existing_draft = draft_service.get_latest(conversation_id=conv.id)
         if existing_draft and existing_draft.content:
+            logger.info(f"[INGEST-GMAIL] {airbnb_thread_id} → draft 이미 존재, 스킵")
             result_items.append(GmailIngestConversationItem(
                 conversation_id=str(conv.id),
                 airbnb_thread_id=airbnb_thread_id,
@@ -664,6 +834,7 @@ async def ingest_gmail_and_generate_drafts(
             logger.warning(f"LLM draft generation failed: {e}")
             content = draft_service.generate_draft(airbnb_thread_id=airbnb_thread_id)
             outcome_label = None
+            suggestion = None
 
         # Safety 평가
         safety, _ = guard.evaluate_text(text=content)
@@ -679,6 +850,26 @@ async def ingest_gmail_and_generate_drafts(
         # Conversation 상태 업데이트
         apply_safety_to_conversation(conv, safety)
         db.add(conv)
+        
+        # ✅ Complaint 추출 (SENSITIVE/HIGH_RISK일 때만)
+        if suggestion and suggestion.outcome_label:
+            from app.services.auto_reply_service import SafetyOutcome
+            safety_outcome = suggestion.outcome_label.safety_outcome
+            
+            if safety_outcome in [SafetyOutcome.SENSITIVE, SafetyOutcome.HIGH_RISK]:
+                try:
+                    from app.services.complaint_extractor import ComplaintExtractor
+                    complaint_extractor = ComplaintExtractor(db, openai_client=openai_client)
+                    complaint_result = complaint_extractor.extract_from_message(
+                        message=last_guest_msg,
+                        conversation=conv,
+                    )
+                    if complaint_result.has_complaint:
+                        logger.info(
+                            f"Complaint 생성: {airbnb_thread_id} → {len(complaint_result.complaints)}건"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to extract complaints: {e}")
 
         result_items.append(GmailIngestConversationItem(
             conversation_id=str(conv.id),

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Dict, Any
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -24,6 +24,8 @@ class ConversationListItemDTO(BaseModel):
     guest_name: Optional[str] = None
     checkin_date: Optional[str] = None
     checkout_date: Optional[str] = None
+    # 예약 상태 (inquiry, awaiting_approval, confirmed, canceled 등)
+    reservation_status: Optional[str] = None
 
 
 class ConversationDTO(ConversationListItemDTO):
@@ -60,11 +62,32 @@ class SendActionLogDTO(BaseModel):
     created_at: datetime
 
 
+class DateConflictDTO(BaseModel):
+    """날짜 충돌 예약 정보"""
+    guest_name: str
+    checkin_date: Optional[str] = None
+    checkout_date: Optional[str] = None
+    status: str
+    reservation_code: Optional[str] = None
+
+
+class DateAvailabilityDTO(BaseModel):
+    """예약 가능 여부 (INQUIRY 상태일 때 표시용)"""
+    available: bool
+    conflicts: List[DateConflictDTO] = []
+
+
 class ConversationDetailResponse(BaseModel):
     conversation: ConversationDTO
     messages: List[ConversationMessageDTO]
     draft_reply: Optional[DraftReplyDTO]
     send_logs: List[SendActionLogDTO]
+    # 발송 가능 여부 (reply_to가 있는지)
+    can_reply: bool = True
+    # 에어비앤비 링크 (can_reply=False일 때 사용)
+    airbnb_action_url: Optional[str] = None
+    # 예약 가능 여부 (INQUIRY 상태일 때만 유효)
+    date_availability: Optional[DateAvailabilityDTO] = None
 
 
 class ConversationListResponse(BaseModel):
@@ -88,9 +111,29 @@ class DraftGenerateResponse(BaseModel):
 
 class SendRequest(BaseModel):
     draft_reply_id: UUID
+    # Orchestrator가 REQUIRE_REVIEW 판정했을 때, 강제 발송 허용
+    force_send: bool = False
+    # Decision 확인했음을 나타내는 로그 ID
+    decision_log_id: Optional[UUID] = None
+
+
+class OrchestratorWarningDTO(BaseModel):
+    """Orchestrator 경고 정보"""
+    code: str
+    message: str
+    severity: Literal["info", "warning", "error"] = "warning"
 
 
 class SendResponse(BaseModel):
     conversation_id: UUID
-    sent_at: datetime
-    status: Literal["sent"] = "sent"
+    sent_at: Optional[datetime] = None
+    status: Literal["sent", "requires_confirmation", "blocked"] = "sent"
+    
+    # Orchestrator 판단 결과 (requires_confirmation일 때)
+    decision: Optional[str] = None
+    reason_codes: Optional[List[str]] = None
+    warnings: Optional[List[OrchestratorWarningDTO]] = None
+    decision_log_id: Optional[UUID] = None
+    
+    # 충돌 정보 (있으면)
+    commitment_conflicts: Optional[List[dict]] = None

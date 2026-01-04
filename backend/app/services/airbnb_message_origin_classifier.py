@@ -9,6 +9,7 @@ from app.domain.intents import (
 
 ROLE_HOST_PATTERNS = [
     r"\n\s*호스트\s*\n",  # 줄 단위로 '호스트' 라벨이 있는 경우
+    r"\n\s*공동\s*호스트\s*\n",  # 줄 단위로 '공동 호스트' 라벨이 있는 경우
 ]
 ROLE_GUEST_PATTERNS = [
     r"\n\s*게스트\s*\n",  # 줄 단위로 '게스트' 라벨이 있는 경우 (예상 패턴)

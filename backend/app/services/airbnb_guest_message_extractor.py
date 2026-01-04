@@ -96,16 +96,19 @@ def _extract_after_profile_block(lines: list[str]) -> Optional[str]:
 
     base_idx: int | None = None
 
-    # 1순위: "가입 연도"
+    # 1순위: "가입 연도" (프로필 영역의 명확한 라벨)
     for i, line in enumerate(lines):
         if "가입 연도" in line:
             base_idx = i
             break
 
-    # 2순위: "예약자"
+    # 2순위: "South Korea" 또는 국가명 (프로필 위치 정보)
+    # "예약자"는 게스트 메시지 내에서도 사용될 수 있으므로 제외
     if base_idx is None:
         for i, line in enumerate(lines):
-            if "예약자" in line:
+            stripped = line.strip()
+            # 국가명만 있는 라인 (프로필 위치)
+            if stripped == "South Korea" or stripped == "Korea" or stripped == "대한민국":
                 base_idx = i
                 break
 
@@ -128,7 +131,11 @@ def _extract_after_profile_block(lines: list[str]) -> Optional[str]:
 
     block_lines = [l.strip() for l in lines[start:k]]
     block = "\n".join(block_lines).strip()
-    return block or None
+    
+    # CTA 패턴이 포함되어 있으면 그 앞까지만
+    block = _cut_before_cta(block)
+    
+    return block.strip() or None
 
 
 def extract_guest_message_segment(raw_text_body: str | None) -> Optional[str]:

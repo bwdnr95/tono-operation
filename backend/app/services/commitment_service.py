@@ -6,6 +6,7 @@ CommitmentService: TONO Layer - Commitment 관리 오케스트레이터
 - LLM(CommitmentExtractor)은 후보만 제시
 - 충돌 판정(ConflictDetector)은 규칙 기반
 - 확정(저장)은 이 서비스가 한다
+- OC(Operational Commitment)는 Commitment에서 파생된다
 
 이 서비스는 TONO Intelligence의 "두뇌" 역할을 한다.
 """
@@ -13,8 +14,9 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, date
 from typing import List, Optional, Tuple
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
@@ -25,10 +27,16 @@ from app.domain.models.commitment import (
     CommitmentStatus,
     RiskSignal,
 )
+from app.domain.models.operational_commitment import (
+    OperationalCommitment,
+    OCStatus,
+    OCTargetTimeType,
+)
 from app.repositories.commitment_repository import (
     CommitmentRepository,
     RiskSignalRepository,
 )
+from app.repositories.oc_repository import OCRepository
 from app.services.commitment_extractor import (
     CommitmentExtractor,
     CommitmentCandidate,
@@ -61,11 +69,12 @@ class CommitmentService:
     # Confidence 임계값: 이 이상이어야 Commitment로 확정
     CONFIDENCE_THRESHOLD = 0.6
     
-    def __init__(self, db: Session) -> None:
+    def __init__(self, db: Session, openai_client=None) -> None:
         self._db = db
         self._commitment_repo = CommitmentRepository(db)
         self._risk_signal_repo = RiskSignalRepository(db)
-        self._extractor = CommitmentExtractor()
+        self._oc_repo = OCRepository(db)  # 🆕 OC 저장용
+        self._extractor = CommitmentExtractor(openai_client=openai_client)
         self._rule_extractor = RuleBasedCommitmentExtractor()
         self._conflict_detector = ConflictDetector()
     
@@ -82,17 +91,19 @@ class CommitmentService:
         property_code: str,
         message_id: Optional[int] = None,
         conversation_context: Optional[str] = None,
-    ) -> Tuple[List[Commitment], List[RiskSignal]]:
+        guest_checkin_date: Optional[date] = None,  # 🆕 OC target_date 계산용
+    ) -> Tuple[List[Commitment], List[RiskSignal], List[OperationalCommitment]]:
         """
         발송된 메시지에서 Commitment 추출 및 저장
         
         이 메서드는 Sent 이벤트 발생 시 호출되어야 한다.
         
         플로우:
-        1. LLM으로 Commitment 후보 추출
+        1. LLM으로 Commitment 후보 추출 (1회 호출)
         2. 기존 Commitment와 충돌 검사
         3. 충돌 있으면 Risk Signal 생성
-        4. Commitment 저장 (충돌 있어도 저장, 단 경고 표시)
+        4. Commitment 저장
+        5. OC 생성 조건 충족 시 OC도 생성 (Staff Alert용)
         
         Args:
             sent_text: 발송된 답변 원문
@@ -101,20 +112,21 @@ class CommitmentService:
             property_code: 숙소 코드
             message_id: 발송 메시지 ID (provenance용)
             conversation_context: 대화 맥락 (정확도 향상용)
+            guest_checkin_date: 게스트 체크인 날짜 (OC target_date 계산용)
         
         Returns:
-            (생성된 Commitment 목록, 생성된 RiskSignal 목록)
+            (생성된 Commitment 목록, 생성된 RiskSignal 목록, 생성된 OC 목록)
         """
         logger.info(
             f"COMMITMENT_SERVICE: Processing sent message for conversation={conversation_id}"
         )
         
         # 1. LLM으로 Commitment 후보 추출
-        candidates = await self._extract_candidates(sent_text, conversation_context)
+        candidates = await self._extract_candidates(sent_text, conversation_context, guest_checkin_date)
         
         if not candidates:
             logger.info("COMMITMENT_SERVICE: No commitment candidates extracted")
-            return [], []
+            return [], [], []
         
         logger.info(f"COMMITMENT_SERVICE: Extracted {len(candidates)} candidates")
         
@@ -126,6 +138,7 @@ class CommitmentService:
         # 3. 충돌 검사 및 처리
         created_commitments: List[Commitment] = []
         created_signals: List[RiskSignal] = []
+        created_ocs: List[OperationalCommitment] = []
         
         for candidate in candidates:
             # Confidence 필터링
@@ -172,6 +185,17 @@ class CommitmentService:
                         new_commitment_id=new_commitment.id,
                     )
                     
+                    # 🆕 OC 생성 조건 확인
+                    oc = self._maybe_create_oc(
+                        candidate=candidate,
+                        commitment=new_commitment,
+                        conversation_id=conversation_id,
+                        message_id=message_id,
+                        guest_checkin_date=guest_checkin_date,
+                    )
+                    if oc:
+                        created_ocs.append(oc)
+                    
                     # existing_commitments 업데이트 (다음 후보 검사용)
                     existing_commitments = [
                         c for c in existing_commitments
@@ -189,25 +213,37 @@ class CommitmentService:
                 )
                 created_commitments.append(commitment)
                 existing_commitments.append(commitment)
+                
+                # 🆕 OC 생성 조건 확인
+                oc = self._maybe_create_oc(
+                    candidate=candidate,
+                    commitment=commitment,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    guest_checkin_date=guest_checkin_date,
+                )
+                if oc:
+                    created_ocs.append(oc)
         
         # DB 커밋
         self._db.commit()
         
         logger.info(
             f"COMMITMENT_SERVICE: Created {len(created_commitments)} commitments, "
-            f"{len(created_signals)} risk signals"
+            f"{len(created_signals)} risk signals, {len(created_ocs)} OCs"
         )
         
-        return created_commitments, created_signals
+        return created_commitments, created_signals, created_ocs
     
     async def _extract_candidates(
         self,
         sent_text: str,
         conversation_context: Optional[str],
+        guest_checkin_date: Optional[date] = None,
     ) -> List[CommitmentCandidate]:
         """Commitment 후보 추출 (LLM + 규칙 기반 fallback)"""
-        # LLM 추출 시도
-        candidates = await self._extractor.extract(sent_text, conversation_context)
+        # LLM 추출 시도 (날짜 정보 전달)
+        candidates = await self._extractor.extract(sent_text, conversation_context, guest_checkin_date)
         
         # LLM 실패 또는 결과 없으면 규칙 기반으로 보충
         if not candidates:
@@ -392,3 +428,109 @@ class CommitmentService:
         count = self._commitment_repo.expire_by_conversation(conversation_id)
         self._db.commit()
         return count
+    
+    # ─────────────────────────────────────────────────────────
+    # 6. OC (Operational Commitment) 생성
+    # ─────────────────────────────────────────────────────────
+    
+    def _maybe_create_oc(
+        self,
+        *,
+        candidate: CommitmentCandidate,
+        commitment: Commitment,
+        conversation_id: uuid.UUID,
+        message_id: Optional[int],
+        guest_checkin_date: Optional[date],
+    ) -> Optional[OperationalCommitment]:
+        """
+        Commitment에서 OC 생성 여부 판단 및 생성
+        
+        OC 생성 조건:
+        1. type이 "action_promise"인 경우 (행동 약속)
+        2. topic이 민감 토픽인 경우 (refund, payment, compensation)
+        
+        Returns:
+            생성된 OC 또는 None
+        """
+        # OC 생성 조건 확인
+        needs_oc = self._should_create_oc(candidate)
+        
+        if not needs_oc:
+            return None
+        
+        # 민감 토픽 여부 (운영자 확인 필요)
+        is_sensitive = candidate.topic in CommitmentTopic.sensitive_topics()
+        
+        # target_date 결정
+        target_date = self._resolve_target_date(
+            candidate=candidate,
+            guest_checkin_date=guest_checkin_date,
+        )
+        
+        # target_time_type 결정
+        target_time_type = OCTargetTimeType.explicit if candidate.target_time_type == "explicit" else OCTargetTimeType.implicit
+        
+        # 같은 topic의 기존 OC supersede
+        self._oc_repo.supersede_by_topic(conversation_id, candidate.topic)
+        
+        # OC 생성
+        oc = OperationalCommitment(
+            id=uuid4(),
+            conversation_id=conversation_id,
+            commitment_id=commitment.id,  # 🔗 FK 연결
+            topic=candidate.topic,
+            description=candidate.value.get("description", candidate.provenance_text),
+            evidence_quote=candidate.provenance_text,  # 필드명 수정
+            target_date=target_date,
+            target_time_type=target_time_type.value,
+            status=OCStatus.pending.value,
+            is_candidate_only=is_sensitive,  # 민감 토픽은 운영자 확인 필요
+            provenance_message_id=message_id,  # 필드명 수정
+            extraction_confidence=candidate.confidence,  # 누락 필드 추가
+            created_at=datetime.utcnow(),
+        )
+        
+        self._db.add(oc)
+        
+        logger.info(
+            f"COMMITMENT_SERVICE: Created OC from commitment - "
+            f"topic={candidate.topic}, type={candidate.type}, "
+            f"is_candidate_only={is_sensitive}"
+        )
+        
+        return oc
+    
+    def _should_create_oc(self, candidate: CommitmentCandidate) -> bool:
+        """OC 생성 여부 판단"""
+        # 1. 행동 약속 (action_promise)이면 OC 생성
+        if candidate.type in CommitmentType.oc_trigger_types():
+            return True
+        
+        # 2. 민감 토픽이면 타입 무관하게 OC 생성
+        if candidate.topic in CommitmentTopic.sensitive_topics():
+            return True
+        
+        return False
+    
+    def _resolve_target_date(
+        self,
+        candidate: CommitmentCandidate,
+        guest_checkin_date: Optional[date],
+    ) -> Optional[date]:
+        """OC target_date 결정"""
+        # LLM이 추출한 날짜가 있으면 사용
+        if candidate.target_date:
+            try:
+                return datetime.strptime(candidate.target_date, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        
+        # "체크인 당일" 같은 경우 guest_checkin_date 사용
+        if guest_checkin_date and candidate.target_time_type == "explicit":
+            # description에 "체크인" 언급이 있으면 체크인 날짜 사용
+            desc = candidate.value.get("description", "").lower()
+            prov = candidate.provenance_text.lower()
+            if "체크인" in desc or "체크인" in prov:
+                return guest_checkin_date
+        
+        return None

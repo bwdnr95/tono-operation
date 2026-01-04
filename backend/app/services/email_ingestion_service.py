@@ -12,15 +12,21 @@ Email Ingestion Service (v4 - Alteration Request 지원)
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Iterable, Optional
 import logging
 
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from app.domain.models.conversation import ConversationChannel
 from app.domain.models.reservation_info import ReservationStatus
 from app.services.conversation_thread_service import ConversationService
 
+from app.domain.intents import (
+    MessageActor,
+    MessageActionability,
+)
 from app.services.airbnb_message_origin_classifier import (
     classify_airbnb_message_origin,
 )
@@ -36,6 +42,8 @@ from app.repositories.reservation_info_repository import (
 )
 from app.repositories.alteration_request_repository import AlterationRequestRepository
 from app.services.message_processor_service import process_message_after_ingestion
+from app.services.notification_service import NotificationService
+from app.domain.models.reservation_info import ReservationInfo
 
 logger = logging.getLogger(__name__)
 
@@ -44,17 +52,19 @@ def _save_reservation_info(
     db: Session,
     parsed,
     gmail_message_id: str,
+    status: str = None,
+    expires_at: datetime = None,
 ) -> None:
     """
     ParsedInternalMessage에서 예약 정보를 추출하여 reservation_info 테이블에 저장.
     
-    시스템 메일(booking_confirmation)에서 호출됨.
+    시스템 메일(booking_confirmation, booking_rtb)에서 호출됨.
     - reservation_code 기준으로 기존 레코드 조회
+    - 없으면 airbnb_thread_id로도 조회 (중복 방지)
     - 있으면 UPDATE, 없으면 INSERT
     - airbnb_thread_id는 메일에서 파싱한 실제 값 사용 (없으면 fallback)
-    - status는 confirmed (CSV 수기 입력과 구분)
-    
-    v6: LLM 기반 파싱 - LLM 결과 우선, 정규식은 fallback
+    - status: confirmed (즉시예약) or awaiting_approval (RTB)
+    - expires_at: RTB 승인 만료 시간 (RTB일 때만 사용)
     """
     repo = ReservationInfoRepository(db)
     reservation_code = getattr(parsed, "reservation_code", None)
@@ -66,106 +76,47 @@ def _save_reservation_info(
         )
         return
     
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # LLM 기반 파싱 (예약 확정 메일은 LLM 우선)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    
-    # 정규식 결과 (fallback용)
-    regex_guest_name = getattr(parsed, "guest_name", None)
-    regex_checkin_date = getattr(parsed, "checkin_date", None)
-    regex_checkout_date = getattr(parsed, "checkout_date", None)
-    regex_guest_count = getattr(parsed, "guest_count", None)
-    
-    # LLM 파싱 시도
-    guest_name = None
-    checkin_date = None
-    checkout_date = None
-    guest_count = None
-    
-    try:
-        from app.services.airbnb_email_parser import parse_booking_confirmation_sync
-        
-        text_body = getattr(parsed, "decoded_text_body", None)
-        html_body = getattr(parsed, "decoded_html_body", None)
-        subject = getattr(parsed, "subject", None)
-        
-        llm_result = parse_booking_confirmation_sync(
-            text_body=text_body,
-            html_body=html_body,
-            subject=subject,
-        )
-        
-        # LLM 결과 사용 (있으면)
-        if llm_result.guest_name:
-            guest_name = llm_result.guest_name
-            logger.info(
-                "LLM parsed guest_name: %s (reservation_code=%s)",
-                guest_name,
-                reservation_code,
-            )
-        
-        if llm_result.checkin_date:
-            checkin_date = llm_result.checkin_date
-            logger.info(
-                "LLM parsed checkin_date: %s (reservation_code=%s)",
-                checkin_date,
-                reservation_code,
-            )
-        
-        if llm_result.checkout_date:
-            checkout_date = llm_result.checkout_date
-            logger.info(
-                "LLM parsed checkout_date: %s (reservation_code=%s)",
-                checkout_date,
-                reservation_code,
-            )
-        
-        if llm_result.guest_count:
-            guest_count = llm_result.guest_count
-            
-    except Exception as e:
+    # ✅ reservation_code 형식 검증: 에어비앤비 코드는 HM으로 시작하고 영숫자 10자
+    import re
+    if not re.match(r'^HM[A-Z0-9]{8,}$', reservation_code):
         logger.warning(
-            "LLM parsing failed: %s (reservation_code=%s)",
-            str(e),
+            "Invalid reservation_code format: '%s' (expected HM + alphanumeric), gmail_message_id=%s",
             reservation_code,
+            gmail_message_id,
         )
+        # RTB(awaiting_approval)인 경우 잘못된 코드면 저장하지 않음
+        if status == "awaiting_approval":
+            logger.info("Skipping RTB with invalid reservation_code: %s", reservation_code)
+            return
     
-    # LLM 결과 없으면 정규식 결과로 fallback
-    if not guest_name:
-        guest_name = regex_guest_name
-    if not checkin_date:
-        checkin_date = regex_checkin_date
-    if not checkout_date:
-        checkout_date = regex_checkout_date
-    if not guest_count:
-        guest_count = regex_guest_count
-    
-    logger.info(
-        "Final parsed values: guest_name=%s, checkin=%s, checkout=%s (reservation_code=%s)",
-        guest_name,
-        checkin_date,
-        checkout_date,
-        reservation_code,
-    )
-    
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # reservation_info 저장
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    
-    # reservation_code로 기존 레코드 조회
+    # 1. reservation_code로 기존 레코드 조회
     existing = repo.get_by_reservation_code(reservation_code)
     
+    # 2. 없으면 airbnb_thread_id로도 조회 (중복 방지)
+    airbnb_thread_id = getattr(parsed, "airbnb_thread_id", None)
+    if not existing and airbnb_thread_id:
+        existing = repo.get_by_airbnb_thread_id(airbnb_thread_id)
+        if existing:
+            logger.info(
+                "Found existing reservation_info by airbnb_thread_id=%s (different reservation_code: %s vs %s)",
+                airbnb_thread_id,
+                existing.reservation_code,
+                reservation_code,
+            )
+    
     if existing:
-        # 기존 레코드 UPDATE (airbnb_thread_id는 유지)
-        repo.update(
-            existing,
-            guest_name=guest_name,
-            guest_count=guest_count,
+        # 기존 레코드 UPDATE
+        # - airbnb_thread_id: pending_으로 시작하면 새 값으로 교체 (RTB → 확정 흐름)
+        # - reservation_code: 다르면 새 값으로 교체 (thread_id로 찾은 경우)
+        # - 그 외 필드는 새 값으로 덮어씀
+        update_kwargs = dict(
+            guest_name=getattr(parsed, "guest_name", None),
+            guest_count=getattr(parsed, "guest_count", None),
             child_count=getattr(parsed, "child_count", None),
             infant_count=getattr(parsed, "infant_count", None),
             pet_count=getattr(parsed, "pet_count", None),
-            checkin_date=checkin_date,
-            checkout_date=checkout_date,
+            checkin_date=getattr(parsed, "checkin_date", None),
+            checkout_date=getattr(parsed, "checkout_date", None),
             checkin_time=_parse_time_string(getattr(parsed, "checkin_time", None)),
             checkout_time=_parse_time_string(getattr(parsed, "checkout_time", None)),
             property_code=getattr(parsed, "property_code", None),
@@ -177,10 +128,90 @@ def _save_reservation_info(
             source_template=getattr(parsed, "x_template", None),
             gmail_message_id=gmail_message_id,
         )
-        logger.info(
-            "Updated reservation_info: reservation_code=%s",
-            reservation_code,
-        )
+        
+        # reservation_code가 다르면 업데이트 (thread_id로 찾은 경우)
+        if existing.reservation_code != reservation_code:
+            update_kwargs["reservation_code"] = reservation_code
+            logger.info(
+                "Updating reservation_code: %s -> %s (airbnb_thread_id=%s)",
+                existing.reservation_code,
+                reservation_code,
+                existing.airbnb_thread_id,
+            )
+        
+        # status가 명시적으로 전달된 경우만 업데이트
+        # 단, 이미 최종 처리된 상태(confirmed, declined, canceled)는 덮어쓰지 않음
+        FINAL_STATUSES = {"confirmed", "declined", "canceled"}
+        if status:
+            if existing.status not in FINAL_STATUSES:
+                update_kwargs["status"] = status
+                
+                # ✅ RTB(awaiting_approval/pending) → confirmed 전환 시 created_at 업데이트
+                # 예약 확정 통계를 "실제 확정일" 기준으로 집계하기 위함
+                if status == "confirmed" and existing.status in ("awaiting_approval", "pending"):
+                    update_kwargs["created_at"] = datetime.utcnow()
+                    logger.info(
+                        "RTB->confirmed: updating created_at to now for reservation_code=%s",
+                        reservation_code,
+                    )
+            else:
+                logger.info(
+                    "Skipping status update: reservation_code=%s already in final status=%s",
+                    reservation_code,
+                    existing.status,
+                )
+        # guest_message가 있으면 추가
+        guest_message = getattr(parsed, "guest_message", None)
+        if guest_message:
+            update_kwargs["guest_message"] = guest_message
+        # action_url이 있으면 추가
+        action_url = getattr(parsed, "action_url", None)
+        if action_url:
+            update_kwargs["action_url"] = action_url
+        
+        # airbnb_thread_id: 기존 값이 pending_이고 새 값이 있으면 업데이트
+        # (RTB → 확정 메일 흐름에서 실제 thread_id로 교체)
+        new_thread_id = getattr(parsed, "airbnb_thread_id", None)
+        if new_thread_id and existing.airbnb_thread_id and existing.airbnb_thread_id.startswith("pending_"):
+            # ✅ 충돌 방지: 새 thread_id가 다른 레코드(문의 등)에 이미 있으면 삭제
+            # 문의 → 예약요청 → 예약확정 흐름에서 문의 레코드는 불필요
+            conflicting = db.execute(
+                select(ReservationInfo).where(
+                    ReservationInfo.airbnb_thread_id == new_thread_id,
+                    ReservationInfo.id != existing.id,
+                )
+            ).scalar()
+            if conflicting:
+                logger.info(
+                    "Deleting conflicting reservation_info (inquiry): id=%s, thread_id=%s, status=%s",
+                    conflicting.id,
+                    conflicting.airbnb_thread_id,
+                    conflicting.status,
+                )
+                db.delete(conflicting)
+                db.flush()
+            
+            update_kwargs["airbnb_thread_id"] = new_thread_id
+            # action_url도 새 thread_id 기반으로 생성
+            if not action_url:
+                update_kwargs["action_url"] = f"https://www.airbnb.co.kr/hosting/thread/{new_thread_id}?thread_type=home_booking"
+            
+        repo.update(existing, **update_kwargs)
+        
+        # 로그: thread_id 변경 여부 포함
+        if "airbnb_thread_id" in update_kwargs:
+            logger.info(
+                "Updated reservation_info: reservation_code=%s, status=%s, airbnb_thread_id=%s (was pending)",
+                reservation_code,
+                status or existing.status,
+                update_kwargs["airbnb_thread_id"],
+            )
+        else:
+            logger.info(
+                "Updated reservation_info: reservation_code=%s, status=%s",
+                reservation_code,
+                status or existing.status,
+            )
     else:
         # 새 레코드 INSERT
         # 메일에서 파싱한 실제 airbnb_thread_id 사용 (없으면 fallback)
@@ -188,16 +219,23 @@ def _save_reservation_info(
         if not airbnb_thread_id:
             airbnb_thread_id = f"pending_{reservation_code.lower()}"
         
+        # action_url: 메일에서 파싱했거나 airbnb_thread_id로 생성
+        action_url = getattr(parsed, "action_url", None)
+        if not action_url and airbnb_thread_id and not airbnb_thread_id.startswith("pending_"):
+            action_url = f"https://www.airbnb.co.kr/hosting/thread/{airbnb_thread_id}?thread_type=home_booking"
+        
         repo.create(
             airbnb_thread_id=airbnb_thread_id,
-            guest_name=guest_name,
-            guest_count=guest_count,
+            status=status,
+            guest_name=getattr(parsed, "guest_name", None),
+            guest_message=getattr(parsed, "guest_message", None),
+            guest_count=getattr(parsed, "guest_count", None),
             child_count=getattr(parsed, "child_count", None),
             infant_count=getattr(parsed, "infant_count", None),
             pet_count=getattr(parsed, "pet_count", None),
             reservation_code=reservation_code,
-            checkin_date=checkin_date,
-            checkout_date=checkout_date,
+            checkin_date=getattr(parsed, "checkin_date", None),
+            checkout_date=getattr(parsed, "checkout_date", None),
             checkin_time=_parse_time_string(getattr(parsed, "checkin_time", None)),
             checkout_time=_parse_time_string(getattr(parsed, "checkout_time", None)),
             property_code=getattr(parsed, "property_code", None),
@@ -208,13 +246,14 @@ def _save_reservation_info(
             nights=getattr(parsed, "nights", None),
             source_template=getattr(parsed, "x_template", None),
             gmail_message_id=gmail_message_id,
+            action_url=action_url,
+            expires_at=expires_at,
         )
         logger.info(
-            "Created reservation_info: reservation_code=%s, airbnb_thread_id=%s, guest_name=%s, checkin=%s",
+            "Created reservation_info: reservation_code=%s, airbnb_thread_id=%s, status=%s",
             reservation_code,
             airbnb_thread_id,
-            guest_name,
-            checkin_date,
+            status,
         )
 
 
@@ -235,6 +274,7 @@ def _handle_booking_inquiry(
     """
     from app.services.conversation_thread_service import ConversationService
     from app.domain.models.conversation import ConversationChannel
+    from app.services.airbnb_message_origin_classifier import classify_airbnb_message_origin
     from app.services.airbnb_guest_message_extractor import extract_guest_message_segment
     
     # 중복 체크
@@ -266,6 +306,22 @@ def _handle_booking_inquiry(
         snippet=getattr(parsed, "snippet", None),
         sender_role=sender_role,
     )
+    
+    # 🔹 예약 문의(booking_inquiry)는 무조건 GUEST 메시지
+    # origin 분류가 UNKNOWN이어도 GUEST로 강제 설정
+    if origin.actor not in (MessageActor.GUEST, MessageActor.HOST):
+        from app.domain.intents import AirbnbMessageOriginResult, MessageActionability
+        origin = AirbnbMessageOriginResult(
+            actor=MessageActor.GUEST,
+            actionability=MessageActionability.NEEDS_REPLY,
+            confidence=0.95,
+            reasons=["booking_inquiry 타입 메일 → 게스트 문의로 강제 분류"],
+            raw_role_label=None,
+        )
+        logger.info(
+            "Booking inquiry: origin overridden to GUEST gmail_message_id=%s",
+            gmail_message_id,
+        )
 
     # pure_guest_message 추출
     if sender_role:
@@ -473,6 +529,8 @@ def _handle_alteration_accepted(
     변경 수락 이메일 처리:
     1. reservation_code로 reservation_info 찾기
     2. pending alteration_request에서 요청된 날짜 가져오기
+       - 먼저 reservation_info_id로 찾기
+       - 없으면 원래 날짜 + listing_name으로 찾기 (fallback)
     3. reservation_info 날짜 업데이트
     4. alteration_request 상태 → accepted
     """
@@ -497,7 +555,22 @@ def _handle_alteration_accepted(
         return
     
     # 2. pending alteration_request 찾기
+    alteration_request = None
+    
+    # 2-1. reservation_info_id로 찾기
     alteration_request = alt_repo.get_pending_by_reservation_info_id(reservation_info.id)
+    
+    # 2-2. Fallback: 원래 날짜로 찾기 (reservation_info_id가 NULL인 경우)
+    if not alteration_request:
+        # reservation_info의 현재 날짜가 원래 날짜일 것
+        alteration_request = alt_repo.get_pending_by_original_dates(
+            original_checkin=reservation_info.checkin_date,
+            original_checkout=reservation_info.checkout_date,
+        )
+        logger.info(
+            "Alteration request found via fallback (original_dates): reservation_code=%s",
+            reservation_code,
+        )
     
     if alteration_request:
         # 3. alteration_request에서 요청된 날짜로 업데이트
@@ -553,12 +626,21 @@ def _handle_alteration_requested(
 ) -> None:
     """
     변경 요청 이메일 처리:
-    1. listing_name + 기존 날짜로 reservation_info 찾기
-    2. alteration_request 생성 (pending)
-    3. reservation_info 상태 → alteration_requested
+    1. 중복 체크 (gmail_message_id)
+    2. listing_name + 기존 날짜로 reservation_info 찾기
+    3. alteration_request 생성 (pending)
+    4. reservation_info 상태 → alteration_requested
     """
     res_repo = ReservationInfoRepository(db)
     alt_repo = AlterationRequestRepository(db)
+    
+    # 0. 중복 체크
+    if alt_repo.exists_by_gmail_message_id(gmail_message_id):
+        logger.debug(
+            "Alteration request already processed: gmail_message_id=%s",
+            gmail_message_id,
+        )
+        return
     
     # 파싱된 정보 추출
     listing_name = getattr(parsed, "ota_listing_name", None)
@@ -705,20 +787,106 @@ async def ingest_airbnb_parsed_messages(
         # 시스템 메일 처리 (reservation_code 기반, airbnb_thread_id 불필요)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         
-        # 1. 예약 확정: reservation_info 생성
+        # 1. 예약 확정 (즉시 예약): reservation_info 생성 (status=confirmed)
         if email_type == "system_booking_confirmation":
             logger.info(
                 "System email (booking confirmation): reservation_code=%s, x_template=%s",
                 reservation_code,
                 x_template,
             )
-            _save_reservation_info(db, parsed, gmail_message_id)
+            _save_reservation_info(
+                db, parsed, gmail_message_id, 
+                status=ReservationStatus.CONFIRMED.value
+            )
             
             # ✅ 기존 conversation/incoming_message가 있으면 정보 업데이트
             # (MESSAGE 메일이 BOOKING_CONFIRMATION보다 먼저 처리된 경우 대비)
             airbnb_thread_id = getattr(parsed, "airbnb_thread_id", None)
             if airbnb_thread_id:
                 _update_existing_conversation_info(db, parsed, airbnb_thread_id)
+            
+            # ✅ 알림 생성: 예약 확정
+            try:
+                notification_svc = NotificationService(db)
+                notification_svc.create_booking_confirmed(
+                    property_code=getattr(parsed, "property_code", None) or "",
+                    guest_name=getattr(parsed, "guest_name", None) or "게스트",
+                    checkin_date=str(getattr(parsed, "checkin_date", "") or ""),
+                    reservation_code=getattr(parsed, "reservation_code", None),
+                    airbnb_thread_id=airbnb_thread_id,
+                )
+                
+                # ✅ 당일 체크인이면 추가 알림
+                checkin_date = getattr(parsed, "checkin_date", None)
+                if checkin_date:
+                    from datetime import date
+                    today = date.today()
+                    if hasattr(checkin_date, 'date'):
+                        checkin_date = checkin_date.date()
+                    if checkin_date == today:
+                        notification_svc.create_same_day_checkin(
+                            property_code=getattr(parsed, "property_code", None) or "",
+                            guest_name=getattr(parsed, "guest_name", None) or "게스트",
+                            reservation_code=getattr(parsed, "reservation_code", None),
+                            airbnb_thread_id=airbnb_thread_id,
+                        )
+            except Exception as e:
+                logger.warning("Failed to create booking confirmation notification: %s", e)
+            
+            continue
+        
+        # 1-1. 예약 요청 (RTB): reservation_info 생성 (status=awaiting_approval)
+        if email_type == "booking_rtb":
+            logger.info(
+                "Booking RTB (request to book): reservation_code=%s, x_template=%s, guest_name=%s",
+                reservation_code,
+                x_template,
+                getattr(parsed, "guest_name", None),
+            )
+            # RTB는 24시간 내 응답 필요 → expires_at 설정
+            received_at = getattr(parsed, "received_at", None)
+            if received_at:
+                rtb_expires_at = received_at + timedelta(hours=24)
+            else:
+                rtb_expires_at = datetime.utcnow() + timedelta(hours=24)
+            
+            # ✅ 문의 → 예약요청 흐름: 같은 thread_id의 문의 레코드 삭제
+            # 문의(inquiry) 레코드가 있으면 예약 불가로 잘못 표시되는 문제 방지
+            rtb_thread_id = getattr(parsed, "airbnb_thread_id", None)
+            if rtb_thread_id:
+                inquiry_record = db.execute(
+                    select(ReservationInfo).where(
+                        ReservationInfo.airbnb_thread_id == rtb_thread_id,
+                        ReservationInfo.status == "inquiry",
+                    )
+                ).scalar()
+                if inquiry_record:
+                    logger.info(
+                        "Deleting inquiry record before RTB: id=%s, thread_id=%s",
+                        inquiry_record.id,
+                        inquiry_record.airbnb_thread_id,
+                    )
+                    db.delete(inquiry_record)
+                    db.flush()
+            
+            _save_reservation_info(
+                db, parsed, gmail_message_id, 
+                status=ReservationStatus.AWAITING_APPROVAL.value,
+                expires_at=rtb_expires_at,
+            )
+            
+            # ✅ 알림 생성: 예약 요청 (RTB) - 24시간 내 응답 필요
+            try:
+                notification_svc = NotificationService(db)
+                notification_svc.create_booking_rtb(
+                    property_code=getattr(parsed, "property_code", None) or "",
+                    guest_name=getattr(parsed, "guest_name", None) or "게스트",
+                    checkin_date=str(getattr(parsed, "checkin_date", "") or ""),
+                    checkout_date=str(getattr(parsed, "checkout_date", "") or ""),
+                    airbnb_thread_id=getattr(parsed, "airbnb_thread_id", None) or "",
+                )
+            except Exception as e:
+                logger.warning("Failed to create RTB notification: %s", e)
             
             continue
         
@@ -730,6 +898,19 @@ async def ingest_airbnb_parsed_messages(
                 x_template,
             )
             _handle_cancellation(db, parsed)
+            
+            # ✅ 알림 생성: 예약 취소
+            try:
+                notification_svc = NotificationService(db)
+                notification_svc.create_booking_cancelled(
+                    property_code=getattr(parsed, "property_code", None) or "",
+                    guest_name=getattr(parsed, "guest_name", None) or "게스트",
+                    reservation_code=getattr(parsed, "reservation_code", None),  # None 그대로 전달
+                    airbnb_thread_id=getattr(parsed, "airbnb_thread_id", None),
+                )
+            except Exception as e:
+                logger.warning("Failed to create cancellation notification: %s", e)
+            
             continue
         
         # 3. 변경 수락: alteration_request 처리 + reservation_info 날짜 업데이트
@@ -868,8 +1049,11 @@ async def ingest_airbnb_parsed_messages(
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Lazy Matching: pending 상태의 reservation_info에 airbnb_thread_id 업데이트
         # (CSV 수기 입력으로 airbnb_thread_id 없이 생성된 reservation_info 대응)
+        # 
+        # 매칭 기준: property_code + guest_name (부분일치)
+        # - incoming_messages는 예약 정보(checkin/checkout) 책임 X
+        # - reservation_info의 pending 상태만 타겟
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        checkin_date = getattr(parsed, "checkin_date", None)
         guest_name = getattr(parsed, "guest_name", None)
         
         reservation_info_repo = ReservationInfoRepository(db)
@@ -877,19 +1061,23 @@ async def ingest_airbnb_parsed_messages(
         # 이미 이 airbnb_thread_id로 연결된 reservation_info가 있으면 스킵
         existing_info = reservation_info_repo.get_by_airbnb_thread_id(airbnb_thread_id)
         
-        if not existing_info and property_code and checkin_date:
+        if not existing_info and property_code:
             # pending 상태인 CSV 수기 입력 데이터에서 매칭 시도
+            # property_code + guest_name 또는 property_code + checkin_date로 매칭
+            checkin_date = getattr(parsed, "checkin_date", None)
             matched = reservation_info_repo.update_pending_reservation_by_lazy_match(
-                checkin_date=checkin_date,
                 property_code=property_code,
                 guest_name=guest_name,
                 airbnb_thread_id=airbnb_thread_id,
+                checkin_date=checkin_date,
             )
             if matched:
                 logger.info(
-                    "Lazy matching: matched reservation_code=%s → airbnb_thread_id=%s",
+                    "Lazy matching: matched reservation_code=%s → airbnb_thread_id=%s (guest_name=%s, checkin_date=%s)",
                     matched.reservation_code,
                     airbnb_thread_id,
+                    guest_name,
+                    checkin_date,
                 )
         
         # NOTE: Fallback reservation_info 생성 제거 (v4)
@@ -910,6 +1098,50 @@ async def ingest_airbnb_parsed_messages(
                 property_code=property_code,
                 received_at=msg.received_at,
             )
+            
+            # ✅ 마지막 발화자가 HOST면 → 처리완료 상태로 변경
+            # (호스트가 이미 응답한 대화는 미응답 목록에 표시 안 함)
+            if conversation and origin.actor == MessageActor.HOST:
+                from app.domain.models.conversation import ConversationStatus
+                conversation.status = ConversationStatus.complete
+                conversation.is_read = True
+                db.add(conversation)
+                db.flush()
+                logger.info(
+                    "Conversation marked complete (last sender=HOST): "
+                    "conversation_id=%s, airbnb_thread_id=%s",
+                    conversation.id,
+                    conversation.airbnb_thread_id,
+                )
+            
+            # ✅ 마지막 발화자가 GUEST면 → pending 상태로 되돌림
+            # (게스트가 추가 메시지 보내면 다시 응답 필요)
+            if conversation and origin.actor == MessageActor.GUEST:
+                from app.domain.models.conversation import ConversationStatus
+                if conversation.status != ConversationStatus.pending:
+                    conversation.status = ConversationStatus.pending
+                    conversation.is_read = False
+                    db.add(conversation)
+                    db.flush()
+                    logger.info(
+                        "Conversation reverted to pending (new guest message): "
+                        "conversation_id=%s, airbnb_thread_id=%s",
+                        conversation.id,
+                        conversation.airbnb_thread_id,
+                    )
+            
+            # ✅ 알림 생성: 새 게스트 메시지
+            if origin.actor == MessageActor.GUEST and pure_guest_message:
+                try:
+                    notification_svc = NotificationService(db)
+                    notification_svc.create_new_guest_message(
+                        property_code=property_code or "",
+                        guest_name=guest_name or "게스트",
+                        message_preview=pure_guest_message[:100],
+                        airbnb_thread_id=airbnb_thread_id,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to create new guest message notification: %s", e)
 
         # 메시지 타입별 후처리 (Staff Notification, Draft 생성 등)
         process_result = process_message_after_ingestion(

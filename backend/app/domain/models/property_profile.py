@@ -271,6 +271,16 @@ class PropertyProfile(Base):
         default=list,
     )
 
+    # ===== iCal 연동 =====
+    ical_url: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    ical_last_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     # ===== 공통 =====
     is_active: Mapped[bool] = mapped_column(
         Boolean,

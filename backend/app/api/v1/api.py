@@ -16,6 +16,13 @@ from app.api.v1 import (
     test_oc,  # 테스트용
     properties,  # 숙소 관리
     dashboard,  # 대시보드
+    analytics,  # 분석
+    calendar,  # 달력 (iCal)
+    notifications,  # 알림
+    push,
+    complaints,  # 🆕 Complaint (게스트 불만/문제)
+    learning,  # 🆕 Learning Agent (AI 품질 분석)
+    orchestrator,  # 🆕 Orchestrator (판단 엔진)
 )
 
 api_router = APIRouter()
@@ -38,9 +45,28 @@ api_router.include_router(properties.router)
 # ✅ Dashboard (대시보드)
 api_router.include_router(dashboard.router)
 
+# ✅ Analytics (분석)
+api_router.include_router(analytics.router)
+
+# ✅ Calendar (달력/iCal)
+api_router.include_router(calendar.router)
+# ✅ Notifications (알림)
+api_router.include_router(notifications.router)
+
 # 🧪 Test API (Production에서 제거)
 api_router.include_router(test_oc.router)
 
+# ✅ Push Notification API
+api_router.include_router(push.router)
+
+# ✅ Complaints (게스트 불만/문제)
+api_router.include_router(complaints.router)
+
+# ✅ Learning Agent (AI 품질 분석)
+api_router.include_router(learning.router)
+
+# ✅ Orchestrator (판단 엔진)
+api_router.include_router(orchestrator.router)
 
 # ============================================================
 # Scheduler API (테스트/관리용)

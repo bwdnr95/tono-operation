@@ -46,6 +46,7 @@ class ResponseOutcome(str, Enum):
     DECLINED_BY_POLICY = "DECLINED_BY_POLICY"  # 정책상 불가/제한 안내
     NEED_FOLLOW_UP = "NEED_FOLLOW_UP"  # "확인 후 안내"로 마무리
     ASK_CLARIFY = "ASK_CLARIFY"  # 게스트에게 추가 질문 요청
+    CLOSING_MESSAGE = "CLOSING_MESSAGE"  # 종료/감사 인사 응답
 
 
 class OperationalOutcome(str, Enum):
@@ -84,8 +85,7 @@ class OutcomeLabel:
     quality_outcome: QualityOutcome
     
     # 근거 필드
-    used_faq_keys: List[str] = field(default_factory=list)
-    used_profile_fields: List[str] = field(default_factory=list)
+    used_faq_keys: List[str] = field(default_factory=list)  # property_profiles 컬럼명 또는 faq_entries key
     rule_applied: List[str] = field(default_factory=list)
     evidence_quote: Optional[str] = None
     
@@ -96,7 +96,6 @@ class OutcomeLabel:
             "safety_outcome": self.safety_outcome.value,
             "quality_outcome": self.quality_outcome.value,
             "used_faq_keys": self.used_faq_keys,
-            "used_profile_fields": self.used_profile_fields,
             "rule_applied": self.rule_applied,
             "evidence_quote": self.evidence_quote,
         }
@@ -131,13 +130,18 @@ class AutoReplyService:
       - Outcome Label 자동 확정 (LLM + Rule 보정)
     """
 
-    def __init__(self, db: Session) -> None:
+    def __init__(self, db: Session, openai_client=None) -> None:
         self._db = db
         self._msg_repo = IncomingMessageRepository(db)
         self._property_repo = PropertyProfileRepository(db)
         self._commitment_repo = CommitmentRepository(db)
         self._reservation_repo = ReservationInfoRepository(db)
         self.closing_detector = ClosingMessageDetector()
+        
+        # OpenAI 클라이언트 (DI)
+        self._client = openai_client
+        # 자동응답 생성용 모델 (품질 중요)
+        self._model = settings.LLM_MODEL_REPLY or settings.LLM_MODEL or "gpt-4.1"
 
     # ══════════════════════════════════════════════════════════════
     # Public API
@@ -184,9 +188,24 @@ class AutoReplyService:
             logger.warning("SKIP(no-property-code): message_id=%s", message_id)
             return None
 
-        # 종료 인사 감지 → 간단 응답
-        guest_message = (msg.pure_guest_message or "").strip()
-        closing = await self.closing_detector.detect(guest_message)
+        # 🆕 연속 게스트 메시지 병합 (호스트 답변 없이 연속된 메시지들)
+        current_message = (msg.pure_guest_message or "").strip()
+        unanswered_messages = self._get_unanswered_guest_messages(
+            airbnb_thread_id=msg.airbnb_thread_id,
+            current_message_id=message_id,
+        )
+        
+        if unanswered_messages:
+            # 연속 메시지가 있으면 병합
+            guest_message = unanswered_messages
+            logger.info(
+                f"AUTO_REPLY: Merged consecutive guest messages for message_id={message_id}"
+            )
+        else:
+            guest_message = current_message
+
+        # 종료 인사 감지 → 간단 응답 (현재 메시지만으로 판단)
+        closing = await self.closing_detector.detect(current_message)
         if closing.is_closing:
             return self._create_closing_suggestion(message_id, locale)
 
@@ -253,8 +272,9 @@ class AutoReplyService:
         if commitments:
             context["commitments"] = [
                 {
-                    "type": c.commitment_type,
-                    "summary": c.summary,
+                    "topic": c.topic,
+                    "type": c.type,
+                    "summary": c.provenance_text,
                     "status": c.status,
                     "created_at": str(c.created_at),
                 }
@@ -297,6 +317,77 @@ class AutoReplyService:
         
         return history
 
+    def _get_unanswered_guest_messages(self, airbnb_thread_id: str, current_message_id: int) -> str:
+        """
+        호스트 답변 없이 연속된 게스트 메시지들을 병합해서 반환
+        
+        조건:
+        1. 호스트 답변이 없는 연속 메시지
+        2. actionability == NEEDS_REPLY인 메시지만
+        3. 30분 이내의 메시지만
+        """
+        from datetime import timedelta
+        from sqlalchemy import select, desc
+        from app.domain.models.incoming_message import IncomingMessage
+        
+        MAX_MERGE_INTERVAL = timedelta(minutes=30)
+        
+        # 최근 메시지 20개 조회 (넉넉히)
+        stmt = (
+            select(IncomingMessage)
+            .where(IncomingMessage.airbnb_thread_id == airbnb_thread_id)
+            .order_by(desc(IncomingMessage.received_at))
+            .limit(20)
+        )
+        messages = list(self._db.execute(stmt).scalars().all())
+        
+        # 시간순 정렬 (오래된 것 → 최신)
+        messages = list(reversed(messages))
+        
+        # 현재 메시지 위치 찾기
+        current_idx = None
+        for i, m in enumerate(messages):
+            if m.id == current_message_id:
+                current_idx = i
+                break
+        
+        if current_idx is None:
+            return ""
+        
+        # 현재 메시지부터 역순으로, 호스트 답변 전까지 게스트 메시지 수집
+        unanswered_messages = []
+        prev_time = None
+        
+        for i in range(current_idx, -1, -1):
+            m = messages[i]
+            direction = getattr(m.direction, "value", str(m.direction))
+            is_guest = "incoming" in direction.lower()
+            
+            if not is_guest:
+                # 호스트 답변 만나면 중단
+                break
+            
+            # 시간 간격 체크 (30분 초과면 중단)
+            if prev_time and m.received_at:
+                time_gap = prev_time - m.received_at
+                if time_gap > MAX_MERGE_INTERVAL:
+                    break
+            
+            # NEEDS_REPLY인 메시지만 병합
+            if m.actionability == MessageActionability.NEEDS_REPLY:
+                text = (m.pure_guest_message or m.content or "").strip()
+                if text:
+                    unanswered_messages.insert(0, text)  # 앞에 추가 (시간순 유지)
+            
+            if m.received_at:
+                prev_time = m.received_at
+        
+        if len(unanswered_messages) <= 1:
+            return ""  # 연속 메시지가 아님
+        
+        # 여러 메시지를 하나로 병합
+        return "\n---\n".join(unanswered_messages)
+
     def _profile_to_dict(self, profile) -> Dict[str, Any]:
         """PropertyProfile을 dict로 변환 (전체 필드)"""
         return {
@@ -338,25 +429,25 @@ class AutoReplyService:
         """
         LLM으로 답변 + Outcome Label 생성
         """
-        api_key = settings.LLM_API_KEY
-        if not api_key:
+        if not self._client:
+            logger.warning("AUTO_REPLY_SERVICE: No OpenAI client available")
             return self._fallback_result(locale)
-
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        model_name = settings.LLM_MODEL or "gpt-4o-mini"
 
         system_prompt = self._build_system_prompt()
         user_prompt = self._build_user_prompt(guest_message, context)
 
         try:
-            resp = client.chat.completions.create(
-                model=model_name,
+            resp = self._client.chat.completions.create(
+                model=self._model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 response_format={"type": "json_object"},
+                temperature=0.4,
+                top_p=1.0,
+                presence_penalty=0.1,
+                frequency_penalty=0.0,
             )
             
             raw_content = resp.choices[0].message.content or "{}"
@@ -370,127 +461,137 @@ class AutoReplyService:
 
     def _build_system_prompt(self) -> str:
         """
-        TONO Superhost Reply System Prompt (v4)
-        - Step by Step 사고 유도
-        - 게스트 의도 분석 명시화
-        - 기존 JSON 구조 호환
+        TONO Superhost Reply System Prompt (v5 - gpt-4.1 최적화)
+        
+        변경사항:
+        - 규칙 나열 → 원칙 중심으로 간소화
+        - INTERNAL CONSIDERATION 도입 (LLM 스스로 판단)
+        - 연속 메시지 맥락 이해 지시 추가
+        - 핵심 예시 3개로 압축
         """
-        return """당신은 숙소 호스트를 대신해 게스트에게 답장을 작성합니다.
+        return """ROLE
+너는 숙소 운영자를 대신해 게스트에게 실제 사람이 보낸 것처럼 자연스럽고 
+신뢰감 있는 답장을 작성한다. 목표는 게스트가 추가 질문 없이, 
+이 메시지 하나로 바로 이해하고 행동할 수 있게 하는 것이다.
 
-## 목표
-게스트의 메시지를 정확히 이해하고, 실제 호스트처럼 자연스럽고 도움이 되는 답변을 작성합니다.
+답변은:
+- 짧고 명확해야 하며
+- 따뜻하지만 과장되면 안 되고
+- 고객센터 공지문이나 AI 같은 말투가 나면 실패다.
 
----
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERNAL CONSIDERATION (출력하지 말 것)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+답변을 작성하기 전에, 아래 사항을 고려한다. 이 판단 과정은 절대 출력하지 않는다.
 
-## 사고 과정 (반드시 이 순서대로 수행)
+1. 답변 대상 파악
+   - LAST_GUEST_MESSAGE와 CONVERSATION_HISTORY를 함께 본다.
+   - 게스트가 연속으로 보낸 메시지들은 하나의 맥락으로 이해하고 전체 의도에 답변한다.
+   - 단, 호스트가 이미 답변한 이슈는 반복하지 않는다.
 
-### Step 1: 대화 맥락 파악
-CONVERSATION_HISTORY를 읽고 파악하세요:
-- 이 대화의 주제는 무엇인가?
-- 게스트가 연속으로 여러 메시지를 보냈다면, 전체를 하나의 맥락으로 이해한다.
-- 호스트가 이미 안내한 내용이 있다면 반복하지 않는다.
+2. 게스트의 현재 상태 판단 (중요!)
+   RESERVATION_STATUS는 날짜 기준 추정값이다. 실제 상태는 메시지에서 파악:
+   - "퇴실했습니다", "나왔어요" → 이미 체크아웃
+   - "도착했어요", "들어왔어요" → 이미 체크인
+   - "가는 중이에요", "몇시에 도착해요" → 아직 체크인 전
+   - 시설/물품 관련 질문 → 숙소에 있음
+   
+   RESERVATION_STATUS와 메시지 내용이 다르면, 메시지 내용을 따른다.
 
-### Step 2: 게스트 의도 분석 (가장 중요!)
-TARGET_GUEST_MESSAGE를 맥락 안에서 해석하세요:
+3. 단정적으로 답할 수 있는가?
+   사실/규정/시간/금액은 반드시 아래 정보에서만:
+   - PROPERTY_INFO, FAQ_ENTRIES, RESERVATION, COMMITMENTS
+   위 정보에 없으면 → "확인 후 안내드리겠습니다."
+   COMMITMENTS와 충돌 가능성 있으면 → 단정하지 말고 "확인 후 안내"
 
-**질문: 게스트가 원하는 것은 무엇인가?**
-- 정보를 알고 싶다 (질문)
-- 문제를 해결해달라 (요청)
-- 불만/문제를 알리고 싶다 (신고)
-- 대화를 마무리하고 싶다 (확인/인사)
-- 상황을 공유하고 싶다 (정보 제공)
+4. 안전 이슈 감지
+   파손·부상·사고·환불·보상·법적 표현이 있으면:
+   ① 안부 먼저 ② 짧은 공감 ③ 조치 또는 "확인 후 안내"
 
-**질문: 게스트의 감정 상태는?**
-- 평온 / 급함 / 걱정 / 불만 / 감사
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WRITING STYLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+정중하고 부드러운 존댓말을 사용한다.
 
-**주의: 마지막 메시지만 보면 안 됩니다!**
-연속된 게스트 메시지가 있다면, 전체 흐름에서 의도를 파악하세요.
-예: 앞에서 "거울이 떨어졌어요"라고 했는데 마지막이 "여기 화장실이에요"라면,
-의도는 "화장실 위치 확인"이 아니라 "문제 신고 + 위치 설명"입니다.
+원칙:
+- 문장 끝은 "~습니다", "~입니다", "~세요", "~에요"로 마무리
+- 따뜻하지만 격식있는 느낌 유지
+- 이모지는 :) 😊 정도만 절제해서 사용 (문장당 최대 1개)
 
-### Step 3: 답변 전략 결정
-게스트 의도에 맞는 답변 방식을 선택하세요:
+금지:
+- 반말, 줄임말, "~요~" 같은 과한 친근함
+- 앵무새 반복: "~라고 하셨는데", "~라는 말씀 잘 알겠습니다"
+- 형식적 표현: "문의 감사드립니다", "안내드립니다", "확인되었습니다"
+- 장문 공지문 스타일
 
-| 의도 | 답변 방식 | 길이 |
-|------|----------|------|
-| 정보 질문 | 정확한 정보 제공 | 2-4문장 |
-| 문제 해결 요청 | 해결 방안 또는 "확인 후 안내" | 2-4문장 |
-| 문제/상황 신고 | 안전 확인 + 사과 + 감사 + 조치 약속 | 2-4문장 |
-| 불만 표현 | 진심 어린 사과 + 조치 약속 | 2-4문장 |
-| 확인/인사 | 간단한 마무리 | 1-2문장 |
+권장 흐름:
+① 짧은 인사 ("안녕하세요!")
+② 핵심 정보
+③ (선택) 부드러운 안내 ("확인 부탁드립니다")
+④ 짧은 마무리 ("감사합니다 :)")
 
-**[문제/상황 신고 상세 가이드]**
-게스트가 시설 문제를 알려준 경우 (떨어짐, 고장, 파손, 누수 등):
-1. **안전 확인 (첫 문장!)**: "다치신 곳은 없으신가요?", "괜찮으세요?"
-2. **사과 (필수!)**: "불편을 드려 정말 죄송합니다", "놀라셨을텐데 죄송해요" - 시설 문제는 호스트 책임이므로 반드시 사과
-3. **감사**: "알려주셔서 감사합니다", "피드백 주셔서 감사드려요"
-4. **조치 약속**: "현장팀에 전달해서 바로 보완하겠습니다"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-예시:
-"아이고, 다치신 곳은 없으신가요? ㅠㅠ 많이 놀라셨을텐데 정말 죄송해요. 
-알려주셔서 너무 감사합니다! 현장팀에 바로 전달해서 단단히 고정해둘게요 🙏"
+[파손 신고] → response_outcome: ANSWERED_GROUNDED, safety_outcome: SENSITIVE
+게스트: "유리컵이 깨졌어요 죄송합니다"
+❌ "유리컵이 깨졌다는 말씀 잘 알겠습니다."
+✅ "다치신 곳은 없으세요? 불편드려 죄송합니다. 괜찮으시다면 다행이에요. 파편은 조심히 치워두시고, 나머지는 저희가 정리하겠습니다 :)"
 
-### Step 4: 답변 작성
-카카오톡으로 대화하듯 자연스럽게 작성하세요.
+[퇴실/감사 인사] → response_outcome: CLOSING_MESSAGE (used_faq_keys: [])
+게스트: "퇴실했습니다!" / "감사합니다!" / "잘 쉬었어요"
+❌ "체크인은 오후 3시부터 가능합니다..." (ANSWERED_GROUNDED 잘못 분류)
+✅ "이용해 주셔서 감사합니다. 안전하게 귀가하셨으면 좋겠습니다. 다음에 또 뵐 수 있으면 좋겠습니다 😊"
 
-**필수 원칙:**
-- 게스트 의도에 맞는 내용만 답변
-- 묻지 않은 정보는 추가하지 않음
-- 정보가 없으면 "확인 후 안내드리겠습니다"
+[일반 질문] → response_outcome: ANSWERED_GROUNDED, used_faq_keys: ["wifi_ssid", "wifi_password"]
+게스트: "와이파이 비밀번호가 뭐에요?"
+❌ "와이파이 비밀번호는 ABC123입니다."
+✅ "안녕하세요! 비밀번호는 ABC123입니다. 네트워크는 'TONO_5G' 선택해주시면 됩니다 :)"
 
-**정보 출처:**
-- PROPERTY_INFO, FAQ_ENTRIES, RESERVATION에 있는 정보만 사용
-- COMMITMENTS에 이전 약속이 있으면 충돌하지 않도록 주의
-- 출처에 없는 정보는 추측하지 않음
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ASK_CLARIFY RULE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+정말로 답변이 불가능한 경우에만 질문한다.
+- 질문은 1개만
+- 질문 전에 왜 필요한지 1문장 설명
 
-**톤:**
-- 따뜻하고 친근하게, 게스트 감정에 공감
-- 이모티콘 적절히 사용 (ㅠㅠ, 🙏, 😊 등)
-- 딱딱한 공지문 스타일 금지 ("안내드립니다", "확인되었습니다" 등)
-- "~할게요", "~드릴게요" 체 사용
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+아래 JSON 형식으로만 출력한다.
 
----
-
-## 민감 이슈 처리
-
-환불/보상/리뷰 협박/법적/안전 이슈가 있으면:
-- safety_outcome = "HIGH_RISK"
-- 단정적 약속 금지
-- "확인 후 안내드리겠습니다" 방식으로 안전하게
-
----
-
-## 예약 상태별 표현 주의 (RESERVATION_STATUS)
-
-- IN_HOUSE (숙박 중): "도착 전", "체크인 전" 금지
-- CHECKED_OUT (퇴실 후): "숙박 중", "머무시는 동안" 금지
-- UPCOMING (체크인 전): "체크아웃", "퇴실" 금지
-
----
-
-## 출력 형식 (JSON)
-
-```json
 {
-  "analysis": {
-    "conversation_topic": "현재 대화 주제 (1문장)",
-    "guest_intent": "게스트가 원하는 것 (1문장)",
-    "response_strategy": "선택한 답변 전략"
-  },
-  "reply_text": "게스트에게 보낼 답변",
+  "reply_text": "게스트에게 보낼 최종 답장",
   "outcome": {
-    "response_outcome": "ANSWERED_GROUNDED | NEED_FOLLOW_UP | ASK_CLARIFY | DECLINED_BY_POLICY",
+    "response_outcome": "ANSWERED_GROUNDED | DECLINED_BY_POLICY | NEED_FOLLOW_UP | ASK_CLARIFY | CLOSING_MESSAGE",
     "operational_outcome": ["NO_OP_ACTION"],
     "safety_outcome": "SAFE | SENSITIVE | HIGH_RISK",
     "quality_outcome": "OK_TO_SEND | REVIEW_REQUIRED | LOW_CONFIDENCE"
   },
-  "used_faq_keys": ["사용한 FAQ 키"],
-  "used_profile_fields": ["사용한 PROPERTY 필드"],
-  "evidence_quote": "HIGH_RISK일 때 근거 인용"
+  "used_faq_keys": [],
+  "evidence_quote": ""
 }
-```
 
-**중요:** analysis를 먼저 작성하고, 그 분석에 맞게 reply_text를 작성하세요."""
+필드 설명:
+- used_faq_keys: 답변 작성 시 참고한 PROPERTY_INFO 또는 FAQ_ENTRIES의 키/컬럼명 (배열)
+  예: ["wifi_ssid", "wifi_password"], ["parking_info"], ["checkin_from", "checkout_until"]
+  PROPERTY_INFO에서 참고했으면 해당 컬럼명, FAQ에서 참고했으면 해당 key 값을 넣는다.
+  정보를 참고하지 않았으면 빈 배열 []
+
+outcome 기준:
+- ANSWERED_GROUNDED: 제공된 정보로 명확히 답함 (used_faq_keys 필수)
+- DECLINED_BY_POLICY: 정책상 불가/제한 안내
+- NEED_FOLLOW_UP: 정보 부족으로 "확인 후 안내"
+- ASK_CLARIFY: 게스트에게 추가 질문 요청
+- CLOSING_MESSAGE: 종료/감사/퇴실 인사에 대한 응답 (used_faq_keys 불필요)
+- SENSITIVE: 불만/클레임 가능성
+- HIGH_RISK: 환불/보상/법적/안전 이슈 → REVIEW_REQUIRED 필수
+
+⚠️ CLOSING_MESSAGE 판단 기준:
+게스트가 "감사합니다", "잘 쉬었어요", "퇴실했습니다", "나왔어요", "좋았어요" 등
+종료/감사/퇴실 인사를 보냈고, 특별한 질문이나 요청이 없는 경우.
+이 경우 답변도 감사/마무리 인사로 작성하고, response_outcome은 반드시 CLOSING_MESSAGE로 설정."""
 
     def _build_user_prompt(self, guest_message: str, context: Dict[str, Any]) -> str:
         """
@@ -512,59 +613,59 @@ TARGET_GUEST_MESSAGE를 맥락 안에서 해석하세요:
             
             today = date.today()
             
-            # status 필드 우선
+            # status가 명시적으로 체크아웃/체크인 완료인 경우
             if status in ["CHECKED_OUT", "CHECKOUT", "COMPLETED"]:
                 reservation_status = "CHECKED_OUT"
             elif status in ["IN_HOUSE", "STAYING", "CHECKED_IN"]:
                 reservation_status = "IN_HOUSE"
-            elif status in ["CONFIRMED", "RESERVED", "UPCOMING"]:
-                reservation_status = "UPCOMING"
             else:
-                # status가 없으면 날짜로 추정
+                # confirmed, reserved 등은 날짜로 세부 판단
                 try:
+                    checkin_date = None
+                    checkout_date = None
+                    
+                    if checkin_str:
+                        checkin_date = date.fromisoformat(str(checkin_str)[:10])
                     if checkout_str:
                         checkout_date = date.fromisoformat(str(checkout_str)[:10])
-                        if checkout_date < today:
-                            reservation_status = "CHECKED_OUT"
-                        elif checkin_str:
-                            checkin_date = date.fromisoformat(str(checkin_str)[:10])
-                            if checkin_date <= today <= checkout_date:
-                                reservation_status = "IN_HOUSE"
-                            elif today < checkin_date:
-                                reservation_status = "UPCOMING"
+                    
+                    if checkout_date and checkout_date < today:
+                        # 체크아웃 날짜가 지남
+                        reservation_status = "CHECKED_OUT"
+                    elif checkout_date and checkout_date == today:
+                        # 체크아웃 당일
+                        reservation_status = "CHECKOUT_DAY"
+                    elif checkin_date and checkin_date > today:
+                        # 체크인 전
+                        reservation_status = "UPCOMING"
+                    elif checkin_date and checkin_date == today:
+                        # 체크인 당일
+                        reservation_status = "CHECKIN_DAY"
+                    elif checkin_date and checkout_date and checkin_date < today < checkout_date:
+                        # 숙박 중
+                        reservation_status = "IN_HOUSE"
                 except:
                     pass
         
         # ═══════════════════════════════════════════════════
-        # 1. TARGET_GUEST_MESSAGE (답변 대상)
+        # 1. GUEST_MESSAGES (답변 대상 - 연속 메시지 병합됨)
         # ═══════════════════════════════════════════════════
-        target_section = f"""TARGET_GUEST_MESSAGE:
+        target_section = f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 GUEST_MESSAGES (호스트 답변 없이 연속된 게스트 메시지 전체)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {guest_message.strip()}
-
-RESERVATION_STATUS: {reservation_status}"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ 위 메시지들에 포함된 모든 질문/요청에 답변하세요.
+RESERVATION_STATUS: {reservation_status}
+"""
 
         # ═══════════════════════════════════════════════════
-        # 2. CONVERSATION_HISTORY (맥락 파악 필수!)
+        # 2. CONVERSATION_HISTORY (이전 대화 참고용)
         # ═══════════════════════════════════════════════════
         history_section = ""
         if context.get("conversation_history"):
-            history = context["conversation_history"][-5:]
-            
-            # 연속 게스트 메시지 감지 (끝에서부터 역순으로)
-            consecutive_guest_count = 0
-            for h in reversed(history):
-                if h['speaker'] == '게스트':
-                    consecutive_guest_count += 1
-                else:
-                    break
-            
-            # 연속 메시지가 2개 이상이면 강조
-            if consecutive_guest_count >= 2:
-                lines = [f"[CONVERSATION_HISTORY] ⚠️ 게스트가 연속 {consecutive_guest_count}개 메시지 전송 - 마지막만 보지 말고 전체 맥락에 답변하세요!"]
-            else:
-                lines = ["[CONVERSATION_HISTORY]"]
-            
-            for h in history:
+            lines = ["[CONVERSATION_HISTORY - 이미 답변된 내용은 반복하지 말 것]"]
+            for h in context["conversation_history"][-5:]:
                 msg_preview = h['message'][:80] + "..." if len(h['message']) > 80 else h['message']
                 lines.append(f"  {h['speaker']}: {msg_preview}")
             history_section = "\n".join(lines) + "\n\n"
@@ -576,7 +677,10 @@ RESERVATION_STATUS: {reservation_status}"""
         if context.get("commitments"):
             lines = ["[COMMITMENTS] (이전 약속 - 충돌하는 답변 금지)"]
             for c in context["commitments"]:
-                lines.append(f"  • {c.get('type', 'N/A')}: {c.get('summary', c.get('provenance_text', 'N/A'))}")
+                topic = c.get('topic', 'N/A')
+                ctype = c.get('type', 'N/A')
+                summary = c.get('summary', c.get('provenance_text', 'N/A'))
+                lines.append(f"  • [{topic}] {ctype}: {summary}")
             commitment_section = "\n".join(lines) + "\n\n"
 
         # ═══════════════════════════════════════════════════
@@ -638,46 +742,49 @@ RESERVATION_STATUS: {reservation_status}"""
         closing_hint = ""
         if reservation_status == "CHECKED_OUT":
             closing_hint = """
-⚠️ RESERVATION_STATUS=CHECKED_OUT (이미 체크아웃 완료)
+⚠️ RESERVATION_STATUS=CHECKED_OUT (체크아웃 완료)
+- 게스트가 이미 숙소를 떠난 상태
 - 금지 표현: "숙박 중", "머무시는 동안", "이용 중", "체크인", "도착"
-- 게스트가 "감사합니다/수고하세요" 종료 인사를 보낸 경우에만 마무리 인사 사용
+"""
+        elif reservation_status == "CHECKOUT_DAY":
+            closing_hint = """
+⚠️ RESERVATION_STATUS=CHECKOUT_DAY (체크아웃 당일)
+- 게스트가 아직 숙소에 있을 수도, 이미 나갔을 수도 있음
+- 메시지 내용으로 판단: "퇴실했습니다", "나왔어요" → 이미 나감 / "아직 있어요", 시설 질문 → 아직 있음
+- 판단 안 되면 중립적으로 답변
 """
         elif reservation_status == "IN_HOUSE":
             closing_hint = """
-⚠️ RESERVATION_STATUS=IN_HOUSE (현재 숙박 중 - 게스트가 이미 숙소에 있음!)
+⚠️ RESERVATION_STATUS=IN_HOUSE (숙박 중)
+- 게스트가 현재 숙소에 있음
 - 금지 표현: "도착 전", "체크인 전", "오시기 전", "방문 전", "도착하시면"
-- 일반 질문엔 정보만 주고 자연스럽게 끊기. 마무리 인사 붙이지 말 것.
+"""
+        elif reservation_status == "CHECKIN_DAY":
+            closing_hint = """
+⚠️ RESERVATION_STATUS=CHECKIN_DAY (체크인 당일)
+- 게스트가 아직 안 왔을 수도, 이미 도착했을 수도 있음
+- 메시지 내용으로 판단: "도착했어요", "들어왔어요" → 이미 도착 / "몇시에 가요", "가는 중" → 아직 안 옴
+- 판단 안 되면 중립적으로 답변
 """
         elif reservation_status == "UPCOMING":
             closing_hint = """
 ⚠️ RESERVATION_STATUS=UPCOMING (체크인 전)
+- 게스트가 아직 도착하지 않은 상태
 - 금지 표현: "체크아웃", "퇴실", "머무시는 동안"
 """
 
         # ═══════════════════════════════════════════════════
-        # 최종 조립 (System Prompt Step과 일치)
+        # 최종 조립
         # ═══════════════════════════════════════════════════
-        return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📜 Step 1: 대화 맥락 파악
+        return f"""{target_section}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{history_section}
+📋 참고 정보 (아래 정보만 사용, 없으면 "확인 후 안내드리겠습니다")
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 Step 2: 게스트 의도 분석 (TARGET 메시지)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{target_section}
-→ 이 메시지를 위 대화 맥락 안에서 해석하세요.
-→ 게스트가 원하는 것은? 감정 상태는?
 
+{history_section}{commitment_section}{reservation_section}{property_section}{faq_section}{closing_hint}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 Step 3: 답변 전략 결정 (참고 정보)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{commitment_section}{reservation_section}{property_section}{faq_section}{closing_hint}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📝 Step 4: 답변 작성
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- 분석한 게스트 의도에 맞게 답변
-- 시설 문제 신고 시: 안전 확인 → 사과 → 감사 → 조치 약속
-- JSON 형식으로 출력"""
+위 정보를 바탕으로 답변을 JSON으로 작성하세요.
+실제 호스트가 카톡 보내듯 자연스럽게. 인사 → 정보 → 부드러운 확인/권유 → 짧은 마무리 순으로."""
 
     def _format_faq_by_category(self, faq_entries: List[Dict]) -> str:
         """FAQ를 카테고리별로 그룹핑"""
@@ -748,7 +855,6 @@ RESERVATION_STATUS: {reservation_status}"""
             safety_outcome=safety_outcome,
             quality_outcome=quality_outcome,
             used_faq_keys=parsed.get("used_faq_keys", []),
-            used_profile_fields=parsed.get("used_profile_fields", []),
             evidence_quote=parsed.get("evidence_quote"),
         )
         
@@ -817,7 +923,6 @@ RESERVATION_STATUS: {reservation_status}"""
             safety_outcome=safety,
             quality_outcome=quality,
             used_faq_keys=llm_outcome.used_faq_keys,
-            used_profile_fields=llm_outcome.used_profile_fields,
             rule_applied=rules_applied,
             evidence_quote=evidence,
         )
@@ -829,12 +934,12 @@ RESERVATION_STATUS: {reservation_status}"""
     def _create_closing_suggestion(self, message_id: int, locale: str) -> DraftSuggestion:
         """종료 인사에 대한 간단 응답"""
         if locale.startswith("ko"):
-            reply_text = "감사합니다! 편안한 시간 보내시고, 추가로 필요한 게 있으면 말씀해 주세요. 😊"
+            reply_text = "감사합니다! 남은 일정도 행복만 가득하시길 기도하겠습니다 : ! 추가로 필요한 게 있으시면 언제든 말씀해주세요! 😊"
         else:
             reply_text = "Thank you! Please let us know if you need anything else. 😊"
         
         outcome_label = OutcomeLabel(
-            response_outcome=ResponseOutcome.ANSWERED_GROUNDED,
+            response_outcome=ResponseOutcome.CLOSING_MESSAGE,
             operational_outcome=[OperationalOutcome.NO_OP_ACTION],
             safety_outcome=SafetyOutcome.SAFE,
             quality_outcome=QualityOutcome.OK_TO_SEND,

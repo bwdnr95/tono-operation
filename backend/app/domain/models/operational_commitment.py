@@ -42,23 +42,37 @@ class OCTopic(str, Enum):
     """OC Topic - 자동 생성 허용/제한 구분"""
     # 자동 생성 허용 (MVP)
     early_checkin = "early_checkin"
+    late_checkout = "late_checkout"
     follow_up = "follow_up"
-    facility_issue = "facility_issue"
+    visit_schedule = "visit_schedule"
+    issue_resolution = "issue_resolution"  # 🆕 문제 해결 (수리, 조치 등)
+    amenity_prep = "amenity_prep"          # 어메니티 준비
     
     # 자동 생성 제한 (운영자 확정 필요)
-    refund_check = "refund_check"
-    payment = "payment"
+    refund_process = "refund_process"
+    payment_process = "payment_process"
     compensation = "compensation"
     
     @classmethod
     def auto_create_allowed(cls) -> set[str]:
         """자동 생성 허용 topic"""
-        return {cls.early_checkin.value, cls.follow_up.value, cls.facility_issue.value}
+        return {
+            cls.early_checkin.value, 
+            cls.late_checkout.value,
+            cls.follow_up.value, 
+            cls.visit_schedule.value,
+            cls.issue_resolution.value,
+            cls.amenity_prep.value,
+        }
     
     @classmethod
     def requires_confirmation(cls) -> set[str]:
         """운영자 확정 필요 topic"""
-        return {cls.refund_check.value, cls.payment.value, cls.compensation.value}
+        return {
+            cls.refund_process.value, 
+            cls.payment_process.value, 
+            cls.compensation.value,
+        }
 
 
 class OCTargetTimeType(str, Enum):

@@ -26,10 +26,21 @@ from app.db.base import Base
 
 class ReservationStatus(str, Enum):
     """예약 상태"""
-    CONFIRMED = "confirmed"              # 예약 확정
-    CANCELED = "canceled"                # 취소됨
-    ALTERATION_REQUESTED = "alteration_requested"  # 변경 요청 중 (현재 사용 안함)
-    # INQUIRY = "inquiry"  # 문의 중 (예약 전) - inquiry_context로 별도 관리
+    # 문의 (예약 전)
+    INQUIRY = "inquiry"                      # 예약 전 문의 (BOOKING_INITIAL_INQUIRY)
+    
+    # 예약 요청 (RTB) 관련
+    AWAITING_APPROVAL = "awaiting_approval"  # 호스트 승인 대기 중 (RTB)
+    DECLINED = "declined"                    # 호스트 거절
+    EXPIRED = "expired"                      # 24시간 초과 만료
+    
+    # 예약 확정 관련
+    CONFIRMED = "confirmed"                  # 예약 확정
+    CANCELED = "canceled"                    # 취소됨
+    ALTERATION_REQUESTED = "alteration_requested"  # 변경 요청 중
+    
+    # 수기 입력 (lazy matching 대기)
+    PENDING = "pending"                      # 수기 입력, conversation 매칭 대기
 
 
 class ReservationInfo(Base):
@@ -52,9 +63,11 @@ class ReservationInfo(Base):
         String(50), nullable=False, default=ReservationStatus.CONFIRMED.value
     )
     canceled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)  # RTB 승인 만료 시간
     
     # 게스트 정보
     guest_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    guest_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # RTB 시 게스트 메시지
     guest_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 성인 수
     child_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 어린이 수
     infant_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 유아 수
@@ -81,6 +94,9 @@ class ReservationInfo(Base):
     source_template: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)  # X-Template 값
     gmail_message_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     
+    # 액션 URL (에어비앤비 호스팅 스레드 URL)
+    action_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
     # 메타
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=datetime.utcnow
@@ -102,8 +118,16 @@ class ReservationInfo(Base):
         parts = []
         
         # 예약 상태
-        if self.status == ReservationStatus.CANCELED.value:
+        if self.status == ReservationStatus.INQUIRY.value:
+            parts.append("💬 예약 상태: 문의 중 (예약 미확정)")
+        elif self.status == ReservationStatus.CANCELED.value:
             parts.append("⚠️ 예약 상태: 취소됨")
+        elif self.status == ReservationStatus.AWAITING_APPROVAL.value:
+            parts.append("⏳ 예약 상태: 승인 대기 중 (예약 요청)")
+        elif self.status == ReservationStatus.DECLINED.value:
+            parts.append("❌ 예약 상태: 거절됨")
+        elif self.status == ReservationStatus.EXPIRED.value:
+            parts.append("⏰ 예약 상태: 만료됨")
         
         if self.guest_name:
             parts.append(f"게스트 이름: {self.guest_name}")

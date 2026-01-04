@@ -20,9 +20,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from app.domain.models.conversation import Conversation
 from app.domain.models.incoming_message import IncomingMessage
+from app.domain.models.reservation_info import ReservationInfo, ReservationStatus
 from app.domain.models.staff_notification import StaffNotification
 from app.repositories.staff_notification_repository import StaffNotificationRepository
 from app.services.conversation_thread_service import DraftService, SafetyGuardService
@@ -138,9 +140,72 @@ class MessageProcessorService:
         - Reply-To가 없어 이메일 답변 불가
         - LLM 초안 생성하여 Draft에 저장 (호스트가 복사해서 에어비앤비 앱에서 사용)
         - Staff Notification 생성
+        - ReservationInfo 생성 (status=inquiry)
         """
         draft_created = False
         notification_created = False
+        
+        # 0. ReservationInfo 생성/업데이트 (문의 정보 저장)
+        if message.airbnb_thread_id:
+            try:
+                existing = self._db.execute(
+                    select(ReservationInfo)
+                    .where(ReservationInfo.airbnb_thread_id == message.airbnb_thread_id)
+                ).scalar_one_or_none()
+                
+                if existing:
+                    # 기존 레코드가 있으면 업데이트 (단, confirmed/canceled는 덮어쓰지 않음)
+                    if existing.status not in (
+                        ReservationStatus.CONFIRMED.value,
+                        ReservationStatus.CANCELED.value,
+                    ):
+                        if message.guest_name:
+                            existing.guest_name = message.guest_name
+                        if message.checkin_date:
+                            existing.checkin_date = message.checkin_date
+                        if message.checkout_date:
+                            existing.checkout_date = message.checkout_date
+                        if message.property_code:
+                            existing.property_code = message.property_code
+                        logger.info(
+                            "Updated ReservationInfo for inquiry: airbnb_thread_id=%s",
+                            message.airbnb_thread_id,
+                        )
+                else:
+                    # 새로 생성
+                    # action_url 생성
+                    action_url = None
+                    if message.airbnb_thread_id:
+                        action_url = f"https://www.airbnb.co.kr/hosting/thread/{message.airbnb_thread_id}?thread_type=home_booking"
+                    
+                    new_info = ReservationInfo(
+                        airbnb_thread_id=message.airbnb_thread_id,
+                        status=ReservationStatus.INQUIRY.value,
+                        guest_name=message.guest_name,
+                        checkin_date=message.checkin_date,
+                        checkout_date=message.checkout_date,
+                        property_code=message.property_code,
+                        listing_id=message.ota_listing_id,
+                        listing_name=message.ota_listing_name,
+                        guest_message=message.pure_guest_message,
+                        source_template="BOOKING_INITIAL_INQUIRY",
+                        gmail_message_id=str(message.id) if message.id else None,
+                        action_url=action_url,
+                    )
+                    self._db.add(new_info)
+                    logger.info(
+                        "Created ReservationInfo for inquiry: airbnb_thread_id=%s, guest=%s",
+                        message.airbnb_thread_id,
+                        message.guest_name,
+                    )
+                
+                self._db.flush()
+            except Exception as e:
+                logger.error(
+                    "Failed to create/update ReservationInfo for inquiry: airbnb_thread_id=%s, error=%s",
+                    message.airbnb_thread_id,
+                    e,
+                )
         
         # 1. Staff Notification 생성
         try:
@@ -207,9 +272,11 @@ class MessageProcessorService:
         Outcome Label도 함께 저장.
         """
         from app.services.auto_reply_service import AutoReplyService
+        from app.adapters.llm_client import get_openai_client
         
         # AutoReplyService v3로 LLM 기반 응답 생성
-        auto_reply_service = AutoReplyService(self._db)
+        openai_client = get_openai_client()
+        auto_reply_service = AutoReplyService(self._db, openai_client=openai_client)
         
         try:
             suggestion = await auto_reply_service.suggest_reply_for_message(

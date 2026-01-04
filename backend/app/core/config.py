@@ -29,9 +29,15 @@ class Settings:
         # Gmail 계정
         self.GMAIL_USER: str = os.getenv("GMAIL_USER", "")
 
-        # LLM 설정  🔥 여기 중요
+        # LLM 설정
         self.LLM_API_KEY: str | None = os.getenv("LLM_API_KEY")
-        self.LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4.1-mini")
+        
+        # 용도별 모델 분리
+        # - REPLY: 자동응답 생성 (품질 중요, 고객 대면)
+        # - PARSER: 메일 파싱, OC/Commitment 추출 (단순 추출, 비용 절감)
+        self.LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4.1")  # 기본값 (하위 호환)
+        self.LLM_MODEL_REPLY: str = os.getenv("LLM_MODEL_REPLY", "gpt-4.1")
+        self.LLM_MODEL_PARSER: str = os.getenv("LLM_MODEL_PARSER", "gpt-4o-mini")
 
 
 settings = Settings()

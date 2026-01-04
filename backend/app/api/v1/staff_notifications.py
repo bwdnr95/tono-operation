@@ -17,7 +17,7 @@ Endpoints:
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 from uuid import UUID
 
@@ -278,6 +278,69 @@ def reject_oc_resolve(
         oc_id=str(oc_id),
         status=oc.status,
         action="reject_resolve",
+        success=True,
+    )
+
+
+class ChangePriorityRequest(BaseModel):
+    """Priority 변경 요청"""
+    priority: str  # "immediate" | "upcoming" | "pending"
+
+
+@router.post("/{oc_id}/change-priority", response_model=OCActionResponse)
+def change_oc_priority(
+    oc_id: UUID,
+    request: ChangePriorityRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    OC 우선순위 변경
+    
+    - immediate: target_date = today (오늘 처리)
+    - upcoming: target_date = today + 1 (내일 처리)
+    - pending: target_date = checkin_date (체크인 당일 기준)
+    """
+    from app.domain.models.operational_commitment import OperationalCommitment, OCTargetTimeType
+    from app.domain.models.conversation import Conversation
+    from app.domain.models.incoming_message import IncomingMessage, MessageDirection
+    
+    oc = db.query(OperationalCommitment).filter(OperationalCommitment.id == oc_id).first()
+    if not oc:
+        raise HTTPException(status_code=404, detail="OC not found")
+    
+    today = date.today()
+    
+    if request.priority == "immediate":
+        oc.target_date = today
+        oc.target_time_type = OCTargetTimeType.explicit.value
+    elif request.priority == "upcoming":
+        oc.target_date = today + timedelta(days=1)
+        oc.target_time_type = OCTargetTimeType.explicit.value
+    elif request.priority == "pending":
+        # guest_checkin_date 조회
+        conv = db.query(Conversation).filter(Conversation.id == oc.conversation_id).first()
+        checkin_date = None
+        if conv:
+            guest_msg = db.query(IncomingMessage).filter(
+                IncomingMessage.airbnb_thread_id == conv.airbnb_thread_id,
+                IncomingMessage.direction == MessageDirection.incoming,
+                IncomingMessage.checkin_date.isnot(None),
+            ).order_by(IncomingMessage.received_at.desc()).first()
+            if guest_msg:
+                checkin_date = guest_msg.checkin_date
+        
+        oc.target_date = checkin_date  # 체크인 날짜로 설정 (없으면 None)
+        oc.target_time_type = OCTargetTimeType.explicit.value if checkin_date else OCTargetTimeType.implicit.value
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid priority: {request.priority}")
+    
+    oc.updated_at = datetime.utcnow()
+    db.commit()
+    
+    return OCActionResponse(
+        oc_id=str(oc_id),
+        status=oc.status,
+        action=f"change_priority_to_{request.priority}",
         success=True,
     )
 

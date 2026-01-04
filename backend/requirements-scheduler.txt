@@ -4,3 +4,4 @@
 #
 # APScheduler - 백그라운드 스케줄링
 apscheduler>=3.10.0
+pgvector>=0.2.0

@@ -1,12 +1,14 @@
 """
 Operational Commitment Service
 
-OC 생성, 해소, Staff Notification 로직을 오케스트레이션한다.
+OC 조회, 해소, Staff Notification 로직을 오케스트레이션한다.
 
 설계 원칙:
 - Conversation이 모든 기준
 - 자동 발송 없음
 - 애매하면 suggested_resolve
+
+NOTE: OC 생성은 CommitmentService에서 담당 (Commitment에서 파생)
 """
 from __future__ import annotations
 
@@ -30,7 +32,6 @@ from app.domain.models.operational_commitment import (
 from app.domain.models.conversation import Conversation
 from app.domain.models.incoming_message import IncomingMessage
 from app.repositories.oc_repository import OCRepository
-from app.services.oc_extractor import OCExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -40,100 +41,20 @@ class OCService:
     Operational Commitment Service
     
     역할:
-    1. Sent 메시지에서 OC 생성
-    2. Guest/Host 메시지 기반 해소 처리
-    3. Staff Notification 목록 제공
+    1. Guest/Host 메시지 기반 해소 처리
+    2. Staff Notification 목록 제공
+    3. OC 상태 변경 (done, resolve 등)
+    
+    NOTE: OC 생성은 CommitmentService._maybe_create_oc()에서 담당
     """
     
     # Confidence threshold
     MIN_CONFIDENCE = 0.7
     
-    def __init__(self, db: Session, llm_client=None):
+    def __init__(self, db: Session, openai_client=None):
         self._db = db
         self._repo = OCRepository(db)
-        self._extractor = OCExtractor(llm_client=llm_client)
-    
-    # ─────────────────────────────────────────────────────────
-    # OC 생성
-    # ─────────────────────────────────────────────────────────
-    
-    async def process_sent_message(
-        self,
-        sent_text: str,
-        conversation_id: UUID,
-        message_id: int,
-        guest_checkin_date: Optional[date] = None,
-        commitment_id: Optional[UUID] = None,
-    ) -> List[OperationalCommitment]:
-        """
-        Sent 메시지에서 OC 추출 및 생성
-        
-        Args:
-            sent_text: 발송된 메시지 본문
-            conversation_id: Conversation ID
-            message_id: 발송된 메시지 ID
-            guest_checkin_date: 게스트 체크인 날짜
-            commitment_id: 연결할 Commitment ID (있으면)
-        
-        Returns:
-            생성된 OC 리스트
-        """
-        # 1. LLM으로 후보 추출
-        candidates = await self._extractor.extract_candidates(
-            sent_text=sent_text,
-            guest_checkin_date=guest_checkin_date,
-        )
-        
-        if not candidates:
-            logger.debug(f"No OC candidates found for message {message_id}")
-            return []
-        
-        # 2. 후보별 OC 생성
-        created_ocs = []
-        
-        for candidate in candidates:
-            # Confidence 필터
-            if candidate.confidence < self.MIN_CONFIDENCE:
-                continue
-            
-            # 같은 topic의 기존 OC supersede 처리
-            self._repo.supersede_by_topic(
-                conversation_id=conversation_id,
-                topic=candidate.topic,
-            )
-            
-            # 자동 생성 제한 topic 확인
-            is_candidate_only = candidate.requires_confirmation()
-            
-            # OC 생성
-            oc = OperationalCommitment(
-                id=uuid4(),
-                commitment_id=commitment_id,
-                conversation_id=conversation_id,
-                provenance_message_id=message_id,
-                topic=candidate.topic,
-                description=candidate.description,
-                evidence_quote=candidate.evidence_quote,
-                target_time_type=candidate.target_time_type,
-                target_date=candidate.target_date,
-                status=OCStatus.pending.value,
-                extraction_confidence=candidate.confidence,
-                is_candidate_only=is_candidate_only,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-            )
-            
-            self._repo.save(oc)
-            created_ocs.append(oc)
-            
-            logger.info(
-                f"Created OC: topic={candidate.topic}, "
-                f"candidate_only={is_candidate_only}, "
-                f"target_type={candidate.target_time_type}"
-            )
-        
-        self._db.commit()
-        return created_ocs
+        # openai_client는 호환성 위해 받지만, 더 이상 사용 안 함
     
     # ─────────────────────────────────────────────────────────
     # OC 해소 (Guest 메시지 기반)

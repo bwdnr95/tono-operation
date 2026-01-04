@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
@@ -15,6 +16,8 @@ from app.services.gmail_fetch_service import get_gmail_service
 from app.repositories.ota_listing_mapping_repository import (
     OtaListingMappingRepository,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # -------------------------------------------------------------------
@@ -44,7 +47,10 @@ def _decode_header_value(value: str | None) -> str:
 def _decode_body_part(part: dict) -> Tuple[Optional[str], Optional[str]]:
     """
     Gmail message payload 의 단일 part 에서 text/plain, text/html 디코딩.
+    Content-Transfer-Encoding이 quoted-printable인 경우 추가 디코딩 수행.
     """
+    import quopri
+    
     mime = part.get("mimeType")
     data = part.get("body", {}).get("data")
 
@@ -56,6 +62,21 @@ def _decode_body_part(part: dict) -> Tuple[Optional[str], Optional[str]]:
     except Exception:
         return None, None
 
+    # Content-Transfer-Encoding 확인
+    headers = part.get("headers", []) or []
+    transfer_encoding = None
+    for h in headers:
+        if h.get("name", "").lower() == "content-transfer-encoding":
+            transfer_encoding = h.get("value", "").lower()
+            break
+    
+    # quoted-printable 디코딩
+    if transfer_encoding == "quoted-printable":
+        try:
+            decoded_bytes = quopri.decodestring(decoded_bytes)
+        except Exception:
+            pass  # 실패하면 원본 유지
+    
     try:
         text = decoded_bytes.decode("utf-8", errors="ignore")
     except Exception:
@@ -66,6 +87,7 @@ def _decode_body_part(part: dict) -> Tuple[Optional[str], Optional[str]]:
     if mime == "text/html":
         return None, text
     return None, None
+
 
 
 def _extract_bodies(payload: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -302,7 +324,10 @@ def _extract_listing_name(
     merged = (text or "") + "\n" + (subject or "")
     m = LISTING_NAME_PATTERN_KR_BRACKET.search(merged)
     if m:
-        return m.group(0).strip()
+        name = m.group(0).strip()
+        # "에 대한 예약 요청/문의" 접미사 제거
+        name = re.sub(r'에\s*대한\s*(예약\s*요청|문의).*$', '', name).strip()
+        return name
 
     return None
 
@@ -387,6 +412,9 @@ def _extract_dates_for_inquiry(
     패턴:
     체크인           체크아웃
     12월 24일 (수)   12월 25일 (목)
+    
+    또는 (같은 줄에 두 날짜):
+    2026년 5월 27일 (수)   2026년 5월 28일 (목)
     """
     base_text = (text or "") + "\n" + (html or "")
     
@@ -396,41 +424,55 @@ def _extract_dates_for_inquiry(
     # 연도 추정
     base_year = received_at.year if received_at else datetime.utcnow().year
     
-    # 방법 1: "체크인" 키워드 근처에서 날짜 찾기
+    # 방법 1: "체크인" 키워드 줄을 찾고, 그 근처에서 날짜 추출
     lines = base_text.splitlines()
+    checkin_line_idx = None
     
     for i, line in enumerate(lines):
-        # 체크인/체크아웃이 같은 줄이나 인접한 줄에 있는 경우
-        if "체크인" in line:
-            # 같은 줄에서 날짜 찾기
-            dates = DATE_KR_SHORT_REGEX.findall(line)
-            if dates:
-                checkin_date = _parse_date_ymd(base_year, int(dates[0][0]), int(dates[0][1]))
-            
-            # 다음 줄들에서 날짜 찾기
+        # "체크인"과 "체크아웃"이 같은 줄에 있는지 확인
+        if "체크인" in line and "체크아웃" in line:
+            checkin_line_idx = i
+            # 다음 줄들에서 날짜 찾기 (같은 줄에 2개 날짜가 있는 경우)
             for j in range(i + 1, min(i + 4, len(lines))):
                 next_line = lines[j]
                 dates = DATE_KR_SHORT_REGEX.findall(next_line)
+                if len(dates) >= 2:
+                    # 첫 번째 = 체크인, 두 번째 = 체크아웃
+                    checkin_date = _parse_date_ymd(base_year, int(dates[0][0]), int(dates[0][1]))
+                    checkout_date = _parse_date_ymd(base_year, int(dates[1][0]), int(dates[1][1]))
+                    break
+                elif len(dates) == 1 and not checkin_date:
+                    checkin_date = _parse_date_ymd(base_year, int(dates[0][0]), int(dates[0][1]))
+            break
+    
+    # 방법 1-2: "체크인"과 "체크아웃"이 다른 줄에 있는 경우
+    if not checkin_date or not checkout_date:
+        for i, line in enumerate(lines):
+            if "체크인" in line and "체크아웃" not in line:
+                dates = DATE_KR_SHORT_REGEX.findall(line)
                 if dates and not checkin_date:
                     checkin_date = _parse_date_ymd(base_year, int(dates[0][0]), int(dates[0][1]))
-                    break
-        
-        if "체크아웃" in line:
-            # 같은 줄에서 날짜 찾기
-            dates = DATE_KR_SHORT_REGEX.findall(line)
-            if dates:
-                checkout_date = _parse_date_ymd(base_year, int(dates[0][0]), int(dates[0][1]))
+                else:
+                    for j in range(i + 1, min(i + 4, len(lines))):
+                        next_line = lines[j]
+                        dates = DATE_KR_SHORT_REGEX.findall(next_line)
+                        if dates and not checkin_date:
+                            checkin_date = _parse_date_ymd(base_year, int(dates[0][0]), int(dates[0][1]))
+                            break
             
-            # 다음 줄들에서 날짜 찾기
-            for j in range(i + 1, min(i + 4, len(lines))):
-                next_line = lines[j]
-                dates = DATE_KR_SHORT_REGEX.findall(next_line)
+            if "체크아웃" in line and "체크인" not in line:
+                dates = DATE_KR_SHORT_REGEX.findall(line)
                 if dates and not checkout_date:
                     checkout_date = _parse_date_ymd(base_year, int(dates[0][0]), int(dates[0][1]))
-                    break
+                else:
+                    for j in range(i + 1, min(i + 4, len(lines))):
+                        next_line = lines[j]
+                        dates = DATE_KR_SHORT_REGEX.findall(next_line)
+                        if dates and not checkout_date:
+                            checkout_date = _parse_date_ymd(base_year, int(dates[0][0]), int(dates[0][1]))
+                            break
     
-    # 방법 2: HTML에서 구조화된 날짜 찾기
-    # "12월 24일 (수)" 형식의 모든 날짜를 찾아서 순서대로 체크인/체크아웃
+    # 방법 2: 모든 날짜를 찾아서 순서대로 사용 (fallback)
     if not checkin_date or not checkout_date:
         all_dates = DATE_KR_SHORT_REGEX.findall(base_text)
         if len(all_dates) >= 2:
@@ -439,12 +481,16 @@ def _extract_dates_for_inquiry(
             if not checkout_date:
                 checkout_date = _parse_date_ymd(base_year, int(all_dates[1][0]), int(all_dates[1][1]))
     
-    # 연도 보정: 체크인이 현재 월보다 이전이면 다음 해
+    # 연도 보정 (v5: 더 정확한 연도 추론)
+    # 예약 날짜는 일반적으로 미래이므로, 현재보다 과거인 날짜는 다음 해로 보정
     if checkin_date and received_at:
-        if checkin_date.month < received_at.month:
-            checkin_date = checkin_date.replace(year=base_year + 1)
-        if checkout_date and checkout_date.month < received_at.month:
-            checkout_date = checkout_date.replace(year=base_year + 1)
+        checkin_date = _infer_year_for_future_date(checkin_date, received_at)
+    if checkout_date and received_at:
+        checkout_date = _infer_year_for_future_date(checkout_date, received_at)
+    
+    # 체크아웃이 체크인보다 앞서면 (연말→연초 경계) 체크아웃을 다음 해로
+    if checkin_date and checkout_date and checkout_date < checkin_date:
+        checkout_date = checkout_date.replace(year=checkout_date.year + 1)
     
     return checkin_date, checkout_date
 
@@ -541,6 +587,48 @@ def _parse_date_ymd(year: int, month: int, day: int) -> Optional[date]:
         return date(year, month, day)
     except Exception:
         return None
+
+
+def _infer_year_for_future_date(
+    parsed_date: date,
+    reference_date: datetime,
+    max_past_days: int = 14,
+    max_future_days: int = 365,
+) -> date:
+    """
+    연도가 없는 날짜의 연도를 추론 (v5).
+    
+    예약 날짜는 일반적으로 미래이므로:
+    - 현재보다 max_past_days 이상 과거 → 다음 해로 보정
+    - 현재보다 max_future_days 이상 미래 → 이전 해로 보정
+    
+    Args:
+        parsed_date: 파싱된 날짜 (연도가 reference_date 기준으로 설정됨)
+        reference_date: 기준 날짜 (보통 이메일 수신 시각)
+        max_past_days: 이 일수 이상 과거면 다음 해로 판단 (기본: 14일)
+        max_future_days: 이 일수 이상 미래면 이전 해로 판단 (기본: 365일)
+    
+    Returns:
+        연도가 보정된 날짜
+    
+    Examples:
+        - 오늘: 2026-01-01, 파싱: 2026-12-31 → 2025-12-31 (과거)
+        - 오늘: 2025-12-31, 파싱: 2025-01-05 → 2026-01-05 (미래)
+    """
+    ref_date = reference_date.date() if hasattr(reference_date, 'date') else reference_date
+    
+    # 현재 연도 기준으로 파싱된 날짜
+    delta_days = (parsed_date - ref_date).days
+    
+    # 너무 과거면 → 다음 해로 보정
+    if delta_days < -max_past_days:
+        return parsed_date.replace(year=parsed_date.year + 1)
+    
+    # 너무 미래면 → 이전 해로 보정
+    if delta_days > max_future_days:
+        return parsed_date.replace(year=parsed_date.year - 1)
+    
+    return parsed_date
 
 
 def _find_date_after_keyword(
@@ -645,6 +733,7 @@ def _extract_stay_dates_from_subject_range(
     연도는:
       - 우선 received_at.year 사용
       - 없으면 올해 기준
+      - v5: 과거/미래 보정 적용
     """
     if not subject:
         return None, None
@@ -662,12 +751,18 @@ def _extract_stay_dates_from_subject_range(
     checkin = _parse_date_ymd(base_year, month, day_start)
     checkout = _parse_date_ymd(base_year, month, day_end)
 
-    # 만약 종료일이 시작일보다 작으면 (예: 12월 30일~1월 2일 같은 케이스를 단순 처리)
-    # 지금은 복잡하게 안 가고, 종료일 < 시작일이면 "한 달 뒤" 정도로만 처리
+    # 연도 보정 (v5)
+    if checkin and received_at:
+        checkin = _infer_year_for_future_date(checkin, received_at)
+    if checkout and received_at:
+        checkout = _infer_year_for_future_date(checkout, received_at)
+
+    # 만약 종료일이 시작일보다 작으면 (예: 12월 30일~1월 2일 같은 케이스)
+    # 체크아웃을 다음 달/다음 해로 보정
     if checkin and checkout and checkout < checkin:
         # month + 1 / year 보정
         next_month = month + 1
-        next_year = base_year
+        next_year = checkin.year
         if next_month > 12:
             next_month = 1
             next_year += 1
@@ -751,6 +846,9 @@ class ParsedInternalMessage:
     # 🔹 Airbnb Thread ID (gmail_thread_id와 별개)
     airbnb_thread_id: Optional[str] = None  # /hosting/thread/숫자에서 추출
     
+    # 🔹 Action URL (에어비앤비 호스팅 스레드 링크)
+    action_url: Optional[str] = None  # https://www.airbnb.co.kr/hosting/thread/{id}?thread_type=home_booking
+    
     # 🔹 변경 요청 관련 (system_alteration_requested 타입일 때만 사용)
     alteration_id: Optional[str] = None
     original_checkin: Optional[date] = None
@@ -825,6 +923,11 @@ BOOKING_INQUIRY_TEMPLATES = {
     "INQUIRY_NEW_INQUIRY",  # 문의 (예약 전)
 }
 
+# 예약 요청 템플릿 (RTB - Request to Book)
+BOOKING_RTB_TEMPLATES = {
+    "BOOKING_RTB_TO_HOST",  # 예약 요청 (호스트 승인 필요)
+}
+
 
 def _classify_email_type(x_template: Optional[str]) -> str:
     """
@@ -839,6 +942,7 @@ def _classify_email_type(x_template: Optional[str]) -> str:
         - "system_skip": 무시 → 완전 스킵
         - "guest_message": 게스트 메시지 → conversation/message 저장
         - "booking_inquiry": 예약 문의 → conversation/message + inquiry_context
+        - "booking_rtb": 예약 요청 (RTB) → reservation_info 생성 (status=awaiting_approval)
         - "unknown": 알 수 없음 → 기존 로직으로 처리
     """
     if not x_template:
@@ -880,6 +984,10 @@ def _classify_email_type(x_template: Optional[str]) -> str:
     if template_upper in BOOKING_INQUIRY_TEMPLATES:
         return "booking_inquiry"
     
+    # 예약 요청 (RTB)
+    if template_upper in BOOKING_RTB_TEMPLATES:
+        return "booking_rtb"
+    
     # X-Template이 있지만 알려진 패턴이 아님
     return "unknown"
 
@@ -905,6 +1013,7 @@ class ParsedReservationInfo:
     total_price: Optional[int] = None
     host_payout: Optional[int] = None
     listing_name: Optional[str] = None
+    action_url: Optional[str] = None
 
 
 def _parse_guest_count(text: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
@@ -995,12 +1104,100 @@ def _parse_price_info(text: str) -> Tuple[Optional[int], Optional[int]]:
     if price_match:
         total_price = int(price_match.group(2).replace(',', ''))
     
-    # 호스트 수령액
+    # 호스트 수령액 - 여러 패턴 시도
+    # 패턴 1: "호스트 수령액: ₩xxx" (예약 확정 메일)
     payout_match = re.search(r'호스트\s*수령액[:\s]*[₩\￦]?\s*([\d,]+)', text)
     if payout_match:
         host_payout = int(payout_match.group(1).replace(',', ''))
     
+    # 패턴 2: "예상 수입은 ₩xxx입니다" (RTB 메일)
+    if not host_payout:
+        payout_match = re.search(r'예상\s*수입은\s*[₩\￦]?\s*([\d,]+)', text)
+        if payout_match:
+            host_payout = int(payout_match.group(1).replace(',', ''))
+    
+    # 패턴 3: "예상 수익" 섹션의 볼드 금액 (RTB HTML)
+    if not host_payout:
+        payout_match = re.search(r'<b>[₩\￦]?\s*([\d,]+)</b>\s*입니다', text)
+        if payout_match:
+            host_payout = int(payout_match.group(1).replace(',', ''))
+    
     return total_price, host_payout
+
+
+def _parse_nights(text: str) -> Optional[int]:
+    """
+    숙박 일수 파싱.
+    예: "1박 요금(1박당 ₩170,000)", "2박", "3 nights"
+    
+    Returns:
+        nights - 숙박 일수
+    """
+    # 패턴 1: "N박 요금" (RTB 메일)
+    match = re.search(r'(\d+)박\s*요금', text)
+    if match:
+        return int(match.group(1))
+    
+    # 패턴 2: "x N 박" (예약 확정 메일)
+    match = re.search(r'x\s*(\d+)\s*박', text)
+    if match:
+        return int(match.group(1))
+    
+    # 패턴 3: 체크인/체크아웃 날짜로 계산 (fallback)
+    # 이건 _parse_reservation_info_from_email에서 처리
+    
+    return None
+
+
+def _parse_rtb_action_url(text: str) -> Optional[str]:
+    """
+    RTB 예약 요청 처리 URL 파싱.
+    예: https://www.airbnb.co.kr/hosting/reservations/details/HM8M8AH338?isPending=true
+    
+    Returns:
+        action_url - 에어비앤비 예약 처리 URL
+    """
+    # isPending=true가 포함된 URL 찾기
+    match = re.search(
+        r'https://www\.airbnb\.co\.kr/hosting/reservations/details/([A-Z0-9]+)\?isPending=true',
+        text
+    )
+    if match:
+        return f"https://www.airbnb.co.kr/hosting/reservations/details/{match.group(1)}?isPending=true"
+    
+    return None
+
+
+def _parse_listing_name(text: str, html: str) -> Optional[str]:
+    """
+    숙소 이름 파싱.
+    RTB 메일의 제목이나 본문에서 추출.
+    
+    Returns:
+        listing_name - 숙소 이름
+    """
+    # 패턴 1: HTML에서 heading2 클래스의 숙소 이름 (대괄호로 시작하는 경우)
+    match = re.search(r'<h2[^>]*class="heading2"[^>]*>\s*(\[[^\]]+\][^<]*)</h2>', html)
+    if match:
+        name = match.group(1).strip()
+        # HTML 엔티티 디코드
+        name = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))), name)
+        return name
+    
+    # 패턴 2: "집 전체" 앞의 숙소 이름
+    match = re.search(r'>\s*(\[[^\]]+\][^<]*)<[^>]*>\s*집\s*전체', html)
+    if match:
+        return match.group(1).strip()
+    
+    # 패턴 3: 일반 텍스트에서 대괄호로 시작하는 이름
+    match = re.search(r'(\[[^\]]+\][^\n]+)\n\s*집\s*전체', text)
+    if match:
+        name = match.group(1).strip()
+        # "에 대한 예약 요청" 등의 접미사 제거
+        name = re.sub(r'에\s*대한\s*(예약\s*요청|문의)', '', name).strip()
+        return name
+    
+    return None
 
 
 def _parse_checkin_checkout_time(text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -1069,6 +1266,15 @@ def _parse_reservation_info_from_email(
     
     # 체크인/체크아웃 시간
     info.checkin_time, info.checkout_time = _parse_checkin_checkout_time(combined)
+    
+    # 숙박 일수
+    info.nights = _parse_nights(combined)
+    
+    # RTB action URL
+    info.action_url = _parse_rtb_action_url(combined)
+    
+    # 숙소 이름
+    info.listing_name = _parse_listing_name(text, html)
     
     return info
 
@@ -1307,20 +1513,78 @@ def _parse_single_message(msg: dict, db: Session) -> List[ParsedInternalMessage]
         if mapping:
             property_code = mapping.property_code
 
-    # 🔹 게스트 이름 / 체크인/체크아웃 추출
-    # BOOKING_INITIAL_INQUIRY는 전용 파서 사용
-    if email_type == "booking_inquiry":
-        guest_name = _extract_guest_name_for_inquiry(
-            subject=subject,
-            text=text_body,
-            html=html_body,
-        )
-        checkin_date, checkout_date = _extract_dates_for_inquiry(
-            text=text_body,
-            html=html_body,
-            received_at=received_at,
-        )
-    else:
+    # 🔹 LLM 파싱이 필요한 이메일 타입
+    LLM_PARSE_TYPES = {
+        "booking_inquiry",              # 문의
+        "system_booking_confirmation",  # 예약 확정
+        "booking_rtb",                  # 예약 요청
+    }
+
+    # 🔹 LLM 파싱 결과 저장 (모든 필드)
+    llm_parsed = None
+    guest_name = None
+    checkin_date = None
+    checkout_date = None
+    
+    if email_type in LLM_PARSE_TYPES:
+        # LLM 먼저 → 정규식 fallback
+        try:
+            from app.services.airbnb_email_parser import parse_booking_confirmation_sync
+            llm_parsed = parse_booking_confirmation_sync(
+                text_body=text_body,
+                html_body=html_body,
+                subject=subject,
+            )
+            # LLM 결과에서 기본 필드 추출
+            if llm_parsed.guest_name:
+                guest_name = llm_parsed.guest_name
+                logger.info(f"LLM_PARSER: Extracted guest_name={guest_name}")
+            if llm_parsed.checkin_date:
+                checkin_date = llm_parsed.checkin_date
+                logger.info(f"LLM_PARSER: Extracted checkin_date={checkin_date}")
+            if llm_parsed.checkout_date:
+                checkout_date = llm_parsed.checkout_date
+                logger.info(f"LLM_PARSER: Extracted checkout_date={checkout_date}")
+        except Exception as e:
+            logger.warning(f"LLM_PARSER: Failed, falling back to regex: {e}")
+        
+        # LLM 실패 시 정규식 fallback (guest_name, checkin_date만)
+        if not guest_name or not checkin_date:
+            if email_type == "booking_inquiry":
+                if not guest_name:
+                    guest_name = _extract_guest_name_for_inquiry(
+                        subject=subject,
+                        text=text_body,
+                        html=html_body,
+                    )
+                if not checkin_date:
+                    checkin_date, checkout_date = _extract_dates_for_inquiry(
+                        text=text_body,
+                        html=html_body,
+                        received_at=received_at,
+                    )
+            else:
+                if not guest_name:
+                    guest_name = _extract_guest_name(
+                        from_addr=from_addr,
+                        subject=subject,
+                        text=text_body,
+                        html=html_body,
+                    )
+                if not checkin_date:
+                    checkin_date, checkout_date = _extract_stay_dates(
+                        text=text_body,
+                        html=html_body,
+                        subject=subject,
+                        received_at=received_at,
+                    )
+    
+    elif email_type == "system_alteration_requested":
+        # 별도 정규식 (alteration 전용, 아래에서 처리)
+        pass
+    
+    elif email_type == "guest_message":
+        # 정규식만 (LLM 불필요, reservation_info에서 조회 가능)
         guest_name = _extract_guest_name(
             from_addr=from_addr,
             subject=subject,
@@ -1334,11 +1598,55 @@ def _parse_single_message(msg: dict, db: Session) -> List[ParsedInternalMessage]
             received_at=received_at,
         )
     
-    # 🔹 예약 정보 파싱 (인원, 예약코드, 금액, 시간)
+    # 나머지 타입 (system_cancellation, system_skip 등)은 파싱 불필요
+    
+    # 🔹 예약 정보 파싱 (인원, 예약코드, 금액, 시간) - 정규식 기본값
     reservation_info = _parse_reservation_info_from_email(text_body, html_body, subject)
+    
+    # 🔹 LLM 결과가 있으면 덮어쓰기 (NULL이 아닌 필드만)
+    if llm_parsed:
+        if llm_parsed.guest_count is not None:
+            reservation_info.guest_count = llm_parsed.guest_count
+            logger.info(f"LLM_PARSER: Using guest_count={llm_parsed.guest_count}")
+        if llm_parsed.child_count is not None:
+            reservation_info.child_count = llm_parsed.child_count
+            logger.info(f"LLM_PARSER: Using child_count={llm_parsed.child_count}")
+        if llm_parsed.infant_count is not None:
+            reservation_info.infant_count = llm_parsed.infant_count
+            logger.info(f"LLM_PARSER: Using infant_count={llm_parsed.infant_count}")
+        if llm_parsed.pet_count is not None:
+            reservation_info.pet_count = llm_parsed.pet_count
+            logger.info(f"LLM_PARSER: Using pet_count={llm_parsed.pet_count}")
+        if llm_parsed.nights is not None:
+            reservation_info.nights = llm_parsed.nights
+            logger.info(f"LLM_PARSER: Using nights={llm_parsed.nights}")
+        if llm_parsed.total_price is not None:
+            reservation_info.total_price = llm_parsed.total_price
+            logger.info(f"LLM_PARSER: Using total_price={llm_parsed.total_price}")
+        if llm_parsed.host_payout is not None:
+            reservation_info.host_payout = llm_parsed.host_payout
+            logger.info(f"LLM_PARSER: Using host_payout={llm_parsed.host_payout}")
+        if llm_parsed.reservation_code:
+            reservation_info.reservation_code = llm_parsed.reservation_code
+            logger.info(f"LLM_PARSER: Using reservation_code={llm_parsed.reservation_code}")
+        if llm_parsed.checkin_time:
+            reservation_info.checkin_time = llm_parsed.checkin_time
+            logger.info(f"LLM_PARSER: Using checkin_time={llm_parsed.checkin_time}")
+        if llm_parsed.checkout_time:
+            reservation_info.checkout_time = llm_parsed.checkout_time
+            logger.info(f"LLM_PARSER: Using checkout_time={llm_parsed.checkout_time}")
+        if llm_parsed.listing_name:
+            reservation_info.listing_name = llm_parsed.listing_name
+            logger.info(f"LLM_PARSER: Using listing_name={llm_parsed.listing_name}")
     
     # 🔹 Airbnb Thread ID 추출 (gmail_thread_id와 별개)
     airbnb_thread_id = _extract_airbnb_thread_id(text_body, html_body)
+    
+    # 🔹 Action URL 생성 (에어비앤비 호스팅 스레드 링크)
+    # RTB 이메일의 경우 isPending URL 우선 사용
+    action_url = reservation_info.action_url
+    if not action_url and airbnb_thread_id:
+        action_url = f"https://www.airbnb.co.kr/hosting/thread/{airbnb_thread_id}?thread_type=home_booking"
     
     # 🔹 변경 요청 메일인 경우 alteration 정보 파싱
     alteration_id = None
@@ -1367,6 +1675,9 @@ def _parse_single_message(msg: dict, db: Session) -> List[ParsedInternalMessage]
             reservation_info.reservation_code = url_reservation_code
     
     # 공통 필드 준비
+    # listing_name: LLM/정규식에서 파싱한 값 우선 사용
+    final_listing_name = reservation_info.listing_name or listing_name
+    
     common_fields = {
         "gmail_thread_id": gmail_thread_id,
         "from_email": from_addr,
@@ -1376,7 +1687,7 @@ def _parse_single_message(msg: dict, db: Session) -> List[ParsedInternalMessage]
         "snippet": snippet,
         "ota": "airbnb",
         "ota_listing_id": listing_id,
-        "ota_listing_name": listing_name,
+        "ota_listing_name": final_listing_name,
         "property_code": property_code,
         "guest_name": guest_name,
         "checkin_date": checkin_date,
@@ -1396,6 +1707,8 @@ def _parse_single_message(msg: dict, db: Session) -> List[ParsedInternalMessage]
         "checkout_time": reservation_info.checkout_time,
         # Airbnb Thread ID
         "airbnb_thread_id": airbnb_thread_id,
+        # Action URL (에어비앤비 호스팅 스레드 링크)
+        "action_url": action_url,
         # 변경 요청 정보
         "alteration_id": alteration_id,
         "original_checkin": original_checkin,

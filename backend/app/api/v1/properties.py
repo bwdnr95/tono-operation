@@ -97,6 +97,10 @@ class PropertyProfileBase(BaseModel):
     amenities: Optional[dict] = None
     extra_metadata: Optional[dict] = None
     faq_entries: Optional[list] = None
+    
+    # iCal 연동
+    ical_url: Optional[str] = None
+    ical_last_synced_at: Optional[datetime] = None
 
 
 class PropertyProfileCreate(PropertyProfileBase):
@@ -166,6 +170,9 @@ class PropertyProfileUpdate(BaseModel):
     amenities: Optional[dict] = None
     extra_metadata: Optional[dict] = None
     faq_entries: Optional[list] = None
+    
+    # iCal 연동
+    ical_url: Optional[str] = None
 
 
 class PropertyProfileResponse(PropertyProfileBase):

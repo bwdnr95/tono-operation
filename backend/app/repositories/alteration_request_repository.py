@@ -54,6 +54,17 @@ class AlterationRequestRepository:
         self.db.flush()
         return request
 
+    def exists_by_gmail_message_id(self, gmail_message_id: str) -> bool:
+        """
+        gmail_message_id로 이미 처리된 변경 요청이 있는지 확인 (중복 방지)
+        """
+        stmt = (
+            select(AlterationRequest.id)
+            .where(AlterationRequest.gmail_message_id == gmail_message_id)
+            .limit(1)
+        )
+        return self.db.execute(stmt).scalar_one_or_none() is not None
+
     def get_pending_by_reservation_info_id(
         self,
         reservation_info_id: int,

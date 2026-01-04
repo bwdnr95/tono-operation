@@ -260,3 +260,29 @@ def get_llm_client() -> LLMClient:
         model = getattr(settings, "LLM_MODEL", None)
         _llm_client_singleton = LLMClient(api_key=api_key, model=model)
     return _llm_client_singleton
+
+
+# ------------------------------------------------------ #
+# OpenAI 클라이언트 싱글톤 (DI용)
+# ------------------------------------------------------ #
+
+_openai_client_singleton: "OpenAI | None" = None
+
+
+def get_openai_client() -> "OpenAI | None":
+    """
+    OpenAI 클라이언트 싱글톤 생성 (DI용).
+    
+    사용처:
+    - AutoReplyService
+    - CommitmentExtractor
+    
+    Returns:
+        OpenAI 클라이언트 인스턴스, API 키 없으면 None
+    """
+    global _openai_client_singleton
+    if _openai_client_singleton is None:
+        api_key = getattr(settings, "LLM_API_KEY", None)
+        if api_key and _HAS_OPENAI_CLIENT:
+            _openai_client_singleton = OpenAI(api_key=api_key)
+    return _openai_client_singleton

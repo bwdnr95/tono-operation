@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, date, time
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 
@@ -40,7 +40,9 @@ class ReservationInfoRepository:
         self,
         airbnb_thread_id: str,
         *,
+        status: Optional[str] = None,
         guest_name: Optional[str] = None,
+        guest_message: Optional[str] = None,
         guest_count: Optional[int] = None,
         child_count: Optional[int] = None,
         infant_count: Optional[int] = None,
@@ -58,11 +60,14 @@ class ReservationInfoRepository:
         nights: Optional[int] = None,
         source_template: Optional[str] = None,
         gmail_message_id: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        action_url: Optional[str] = None,
     ) -> ReservationInfo:
         """새 예약 정보 생성"""
         info = ReservationInfo(
             airbnb_thread_id=airbnb_thread_id,
             guest_name=guest_name,
+            guest_message=guest_message,
             guest_count=guest_count,
             child_count=child_count,
             infant_count=infant_count,
@@ -80,9 +85,22 @@ class ReservationInfoRepository:
             nights=nights,
             source_template=source_template,
             gmail_message_id=gmail_message_id,
+            expires_at=expires_at,
+            action_url=action_url,
         )
+        if status:
+            info.status = status
         self.db.add(info)
         self.db.flush()
+        
+        # 오버부킹 체크 (canceled 제외, 생성 후 체크)
+        if status != "canceled":
+            self.check_and_notify_overbooking(
+                property_code=property_code,
+                checkin_date=checkin_date,
+                exclude_airbnb_thread_id=None,  # 이미 포함되어 있으므로 제외 불필요
+            )
+        
         return info
 
     def update(
@@ -130,7 +148,7 @@ class ReservationInfoRepository:
         
         if existing:
             # 기존 값이 있으면 None이 아닌 값만 업데이트
-            return self.update(
+            updated = self.update(
                 existing,
                 guest_name=guest_name,
                 guest_count=guest_count,
@@ -151,8 +169,18 @@ class ReservationInfoRepository:
                 source_template=source_template,
                 gmail_message_id=gmail_message_id,
             )
+            
+            # UPDATE 후 오버부킹 체크 (canceled 제외)
+            if updated.status != "canceled":
+                self.check_and_notify_overbooking(
+                    property_code=updated.property_code,
+                    checkin_date=updated.checkin_date,
+                    exclude_airbnb_thread_id=None,
+                )
+            
+            return updated
         else:
-            # 없으면 새로 생성
+            # 없으면 새로 생성 (create에서 오버부킹 체크 포함)
             return self.create(
                 airbnb_thread_id=airbnb_thread_id,
                 guest_name=guest_name,
@@ -325,42 +353,80 @@ class ReservationInfoRepository:
 
     def update_pending_reservation_by_lazy_match(
         self,
-        checkin_date: date,
         property_code: str,
         guest_name: Optional[str],
         airbnb_thread_id: str,
+        checkin_date: Optional[date] = None,
     ) -> Optional[ReservationInfo]:
         """
-        pending 상태의 예약을 lazy matching으로 찾아서
-        airbnb_thread_id 업데이트 + status를 confirmed로 변경
+        pending 상태이거나 airbnb_thread_id가 MANUAL_/pending_으로 시작하는 예약을
+        lazy matching으로 찾아서 실제 airbnb_thread_id로 업데이트
+        
+        매칭 대상:
+        - status == "pending" (CSV 수기 입력)
+        - airbnb_thread_id가 "MANUAL_" 또는 "pending_"으로 시작
         
         매칭 순서:
-        1. checkin_date + property_code + guest_name (부분일치)
-        2. checkin_date + property_code (fallback)
+        1. property_code + guest_name (부분일치)
+        2. property_code + checkin_date (호스트/공동호스트 메시지용)
+        3. property_code만 (단일 pending만 있을 때)
         
         Returns:
             업데이트된 ReservationInfo, 없으면 None
+            
+        Note:
+            2차/3차 매칭에서 2건 이상 발견 시 오버부킹 의심 → 알림 발송, 매칭 스킵
         """
         info = None
         
+        # 매칭 조건: status가 pending이거나, airbnb_thread_id가 MANUAL_/pending_으로 시작
+        pending_condition = or_(
+            ReservationInfo.status == "pending",
+            ReservationInfo.airbnb_thread_id.like("MANUAL_%"),
+            ReservationInfo.airbnb_thread_id.like("pending_%"),
+        )
+        
         # 1차: guest_name 부분일치 포함
         if guest_name:
+            # guest_name 정규화 (공백 제거, 대소문자 무시)
+            normalized_name = guest_name.strip()
             stmt = select(ReservationInfo).where(
-                ReservationInfo.status == "pending",
-                ReservationInfo.checkin_date == checkin_date,
+                pending_condition,
                 ReservationInfo.property_code == property_code,
-                ReservationInfo.guest_name.ilike(f"%{guest_name}%"),
+                ReservationInfo.guest_name.ilike(f"%{normalized_name}%"),
             )
             info = self.db.execute(stmt).scalar_one_or_none()
         
-        # 2차 fallback: guest_name 없이
+        # 2차: checkin_date 매칭 (호스트/공동호스트 메시지용)
+        if not info and checkin_date:
+            stmt = select(ReservationInfo).where(
+                pending_condition,
+                ReservationInfo.property_code == property_code,
+                ReservationInfo.checkin_date == checkin_date,
+            )
+            results = list(self.db.execute(stmt).scalars().all())
+            
+            if len(results) == 1:
+                info = results[0]
+            elif len(results) > 1:
+                # 🚨 오버부킹 의심 → 알림 발송, 매칭 스킵
+                self._notify_overbooking(
+                    property_code=property_code,
+                    checkin_date=checkin_date,
+                    reservations=results,
+                )
+                return None
+        
+        # 3차 fallback: guest_name 없이 (단일 pending만 있을 때)
         if not info:
             stmt = select(ReservationInfo).where(
-                ReservationInfo.status == "pending",
-                ReservationInfo.checkin_date == checkin_date,
+                pending_condition,
                 ReservationInfo.property_code == property_code,
             )
-            info = self.db.execute(stmt).scalar_one_or_none()
+            results = list(self.db.execute(stmt).scalars().all())
+            if len(results) == 1:
+                # 단일 pending만 있을 때만 매칭 (모호함 방지)
+                info = results[0]
         
         if not info:
             return None
@@ -370,6 +436,152 @@ class ReservationInfoRepository:
         info.updated_at = datetime.utcnow()
         self.db.flush()
         return info
+    
+    def _notify_overbooking(
+        self,
+        property_code: str,
+        checkin_date: date,
+        reservations: list[ReservationInfo],
+    ) -> None:
+        """오버부킹 의심 알림 발송"""
+        try:
+            from app.services.notification_service import NotificationService
+            notification_svc = NotificationService(self.db)
+            notification_svc.create_overbooking_alert(
+                property_code=property_code,
+                checkin_date=str(checkin_date),
+                reservation_count=len(reservations),
+                guest_names=[r.guest_name or "Unknown" for r in reservations],
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to create overbooking alert: {e}")
+
+    def check_and_notify_overbooking(
+        self,
+        property_code: Optional[str],
+        checkin_date: Optional[date],
+        exclude_airbnb_thread_id: Optional[str] = None,
+    ) -> bool:
+        """
+        오버부킹 여부 체크 및 알림 발송
+        
+        같은 property_code + checkin_date에 2건 이상의 예약이 있으면 오버부킹 의심.
+        
+        제외 대상 status:
+        - canceled: 취소됨
+        - declined: 호스트 거절
+        - expired: 만료됨
+        - inquiry: 문의만 (예약 아님)
+        
+        Args:
+            property_code: 숙소 코드
+            checkin_date: 체크인 날짜
+            exclude_airbnb_thread_id: 제외할 airbnb_thread_id (자기 자신)
+            
+        Returns:
+            True if overbooking detected, False otherwise
+        """
+        if not property_code or not checkin_date:
+            return False
+        
+        # 오버부킹 체크 제외 status
+        excluded_statuses = ["canceled", "declined", "expired", "inquiry"]
+        
+        stmt = select(ReservationInfo).where(
+            ReservationInfo.property_code == property_code,
+            ReservationInfo.checkin_date == checkin_date,
+            ReservationInfo.status.notin_(excluded_statuses),
+        )
+        
+        results = list(self.db.execute(stmt).scalars().all())
+        
+        # 자기 자신 제외
+        if exclude_airbnb_thread_id:
+            results = [r for r in results if r.airbnb_thread_id != exclude_airbnb_thread_id]
+        
+        if len(results) >= 2:
+            # 오버부킹 의심 → 알림 발송
+            self._notify_overbooking(
+                property_code=property_code,
+                checkin_date=checkin_date,
+                reservations=results,
+            )
+            return True
+        
+        return False
+
+    def check_date_availability(
+        self,
+        property_code: str,
+        checkin_date: date,
+        checkout_date: Optional[date] = None,
+        exclude_airbnb_thread_id: Optional[str] = None,
+    ) -> dict:
+        """
+        특정 날짜에 예약 가능 여부 확인 (INQUIRY 문의 시 UI 표시용)
+        
+        체크인~체크아웃 기간 동안 겹치는 예약이 있는지 확인.
+        
+        Args:
+            property_code: 숙소 코드
+            checkin_date: 체크인 날짜
+            checkout_date: 체크아웃 날짜 (없으면 checkin_date + 1일)
+            exclude_airbnb_thread_id: 제외할 airbnb_thread_id (자기 자신)
+            
+        Returns:
+            {
+                "available": bool,
+                "conflicts": [
+                    {
+                        "guest_name": str,
+                        "checkin_date": str,
+                        "checkout_date": str,
+                        "status": str,
+                        "reservation_code": str | None,
+                    },
+                    ...
+                ]
+            }
+        """
+        from datetime import timedelta
+        
+        if not checkout_date:
+            checkout_date = checkin_date + timedelta(days=1)
+        
+        # 유효한 예약 status (충돌 체크 대상)
+        # inquiry는 제외 (문의는 예약이 아님)
+        valid_statuses = ["confirmed", "pending", "awaiting_approval", "alteration_requested"]
+        
+        # 날짜 겹침 조건:
+        # 기존 예약의 checkin < 새 checkout AND 기존 예약의 checkout > 새 checkin
+        stmt = select(ReservationInfo).where(
+            ReservationInfo.property_code == property_code,
+            ReservationInfo.status.in_(valid_statuses),
+            ReservationInfo.checkin_date < checkout_date,
+            ReservationInfo.checkout_date > checkin_date,
+        )
+        
+        results = list(self.db.execute(stmt).scalars().all())
+        
+        # 자기 자신 제외
+        if exclude_airbnb_thread_id:
+            results = [r for r in results if r.airbnb_thread_id != exclude_airbnb_thread_id]
+        
+        conflicts = []
+        for r in results:
+            conflicts.append({
+                "guest_name": r.guest_name or "Unknown",
+                "checkin_date": str(r.checkin_date) if r.checkin_date else None,
+                "checkout_date": str(r.checkout_date) if r.checkout_date else None,
+                "status": r.status,
+                "reservation_code": r.reservation_code,
+            })
+        
+        return {
+            "available": len(conflicts) == 0,
+            "conflicts": conflicts,
+        }
 
 
 def _parse_time_string(time_str: Optional[str]) -> Optional[time]:

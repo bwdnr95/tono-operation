@@ -314,10 +314,18 @@ def bulk_send(body: BulkSendRequest, db: Session = Depends(get_db)):
                 }
             )
             
-            # 🆕 Commitment + OC 추출 (발송 후)
+            # 🆕 Commitment + OC + Embedding 추출 (발송 후)
             try:
                 import asyncio
                 send_handler = SendEventHandler(db)
+                
+                # 🆕 Few-shot Learning용 게스트 메시지
+                guest_message_for_embedding = (
+                    draft.guest_message_snapshot 
+                    or last_incoming.pure_guest_message 
+                    or ""
+                )
+                
                 # bulk에서는 동기로 처리 (이미 루프 안이므로)
                 asyncio.get_event_loop().run_until_complete(
                     send_handler.on_message_sent(
@@ -327,6 +335,9 @@ def bulk_send(body: BulkSendRequest, db: Session = Depends(get_db)):
                         message_id=out_msg.id,
                         conversation_id=conv.id,
                         guest_checkin_date=last_incoming.checkin_date,  # OC target_date 계산용
+                        # 🆕 Few-shot Learning용
+                        guest_message=guest_message_for_embedding,
+                        was_edited=draft.is_edited,
                     )
                 )
             except Exception as ce:
