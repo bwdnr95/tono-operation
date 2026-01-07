@@ -26,6 +26,8 @@ class ConversationListItemDTO(BaseModel):
     checkout_date: Optional[str] = None
     # 예약 상태 (inquiry, awaiting_approval, confirmed, canceled 등)
     reservation_status: Optional[str] = None
+    # 마지막 발송 액션 (send, auto_sent 등)
+    last_send_action: Optional[str] = None
 
 
 class ConversationDTO(ConversationListItemDTO):

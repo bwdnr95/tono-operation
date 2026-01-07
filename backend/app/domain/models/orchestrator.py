@@ -114,6 +114,7 @@ class HumanAction(str, Enum):
     REJECTED = "rejected"                     # 거부 (발송 안 함)
     ESCALATED = "escalated"                   # 상위 담당자에게 전달
     PENDING = "pending"                       # 아직 액션 없음
+    AUTO_SENT = "auto_sent"                  # 시스템이 자동 발송
 
 
 class AutomationEligibility(str, Enum):

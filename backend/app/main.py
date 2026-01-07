@@ -15,7 +15,7 @@ async def lifespan(app: FastAPI):
     FastAPI Lifespan - 앱 시작/종료 시 실행
     """
     # Startup
-    start_scheduler(interval_minutes=5)
+    start_scheduler()
     yield
     # Shutdown
     shutdown_scheduler()

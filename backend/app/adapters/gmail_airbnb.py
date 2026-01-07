@@ -1817,7 +1817,7 @@ def _build_search_query(
 def fetch_and_parse_recent_airbnb_messages(
     *,
     db: Session,
-    max_results: int = 50,
+    max_results: int = 20,
     newer_than_days: int = 3,
     extra_query: str | None = None,
     query: str | None = None,

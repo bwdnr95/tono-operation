@@ -4,14 +4,14 @@ TONO Orchestrator Core
 
 판단(Decision) 엔진: Draft에 대해 어떤 액션을 취할지 결정
 
-v2 변경사항:
-- 패턴 매칭 로직 수정 (실제 작동하도록)
-- AUTO_SEND 조건 개선
-- 기본값을 SUGGEST_SEND로 변경 (데이터 축적 단계)
+v3 변경사항:
+- AUTO_SEND 로직 개선: 안전장치(GLOBAL_SAFETY_GUARD) + FAQ Stats 기반 판단
+- property_faq_auto_send_stats 연동
+- 기존 automation_patterns는 하위 호환용으로 유지
 
 핵심 원칙:
 1. BLOCK만 실제로 발송을 막음
-2. AUTO_SEND는 패턴 매칭 + is_auto_approved일 때만
+2. AUTO_SEND는 안전장치 통과 + FAQ Stats eligible일 때
 3. SUGGEST_SEND/REQUIRE_REVIEW는 사람이 버튼 누르면 발송됨
 4. Decision Log는 항상 기록 (학습 데이터)
 """
@@ -35,6 +35,7 @@ from app.domain.models.orchestrator import (
     AutomationPattern, 
     PolicyRule,
 )
+from app.domain.models.property_faq_auto_send_stats import PropertyFaqAutoSendStats
 
 
 logger = logging.getLogger(__name__)
@@ -154,39 +155,48 @@ class OrchestratorService:
         Draft에 대한 판단 수행
         
         1. Reason Codes 수집
-        2. 패턴 매칭
-        3. 충돌 검사
-        4. 최종 Decision 산출
-        5. 로그 기록
+        2. 안전장치 체크 (GLOBAL_SAFETY_GUARD)
+        3. FAQ Stats 체크 (property_faq_auto_send_stats)
+        4. 충돌 검사
+        5. 최종 Decision 산출
+        6. 로그 기록
         """
         # 1. Reason Codes 수집
         reason_codes = await self._collect_reason_codes(evidence)
         
-        # 2. 패턴 매칭
+        # 2. 안전장치 체크 (GLOBAL_SAFETY_GUARD)
+        safety_guard_passed = self._check_safety_guard(evidence, reason_codes)
+        
+        # 3. FAQ Stats 체크 (property_faq_auto_send_stats)
+        faq_stats_match = self._check_faq_stats_eligible(evidence)
+        
+        # 4. 기존 패턴 매칭 (하위 호환용, 추후 제거 가능)
         pattern_match = self._match_automation_pattern(evidence, reason_codes)
         
-        # 3. 충돌 검사
+        # 5. 충돌 검사
         conflicts = self._check_commitment_conflicts(evidence)
         has_conflicts = len(conflicts) > 0
         
-        # 4. 신뢰도 계산
+        # 6. 신뢰도 계산
         confidence = self._calculate_confidence(evidence, reason_codes)
         
-        # 5. 경고 수집
+        # 7. 경고 수집
         warnings = self._collect_warnings(evidence, reason_codes, conflicts)
         
-        # 6. 최종 Decision 산출
+        # 8. 최종 Decision 산출
         decision = self._compute_final_decision(
             reason_codes=reason_codes,
             pattern_match=pattern_match,
             has_conflicts=has_conflicts,
             confidence=confidence,
+            safety_guard_passed=safety_guard_passed,
+            faq_stats_match=faq_stats_match,
         )
         
-        # 7. 필수 필드 체크
+        # 9. 필수 필드 체크
         required_fields = self._check_required_fields(evidence, reason_codes)
         
-        # 8. 결과 생성 및 로깅
+        # 10. 결과 생성 및 로깅
         return await self._finalize_decision(
             evidence=evidence,
             decision=decision,
@@ -196,6 +206,7 @@ class OrchestratorService:
             required_fields=required_fields,
             commitment_conflicts=conflicts,
             pattern_match=pattern_match,
+            faq_stats_match=faq_stats_match,
         )
     
     # ─────────────────────────────────────────────────────
@@ -226,19 +237,33 @@ class OrchestratorService:
         self,
         outcome_label: Dict[str, Any],
     ) -> List[ReasonCode]:
-        """OutcomeLabel 분석"""
+        """
+        OutcomeLabel 분석
+        
+        OutcomeLabel은 AutoReplyService(Execution AI)가 생성한 4축 평가:
+        - response_outcome: 응답 유형 (FAQ 기반, 호스트 입력 필요 등)
+        - quality_outcome: 검토 강도 (OK_TO_SEND, REVIEW_REQUIRED, LOW_CONFIDENCE)
+        - safety_outcome: 민감도 (SAFE, SENSITIVE, HIGH_RISK)
+        - operational_outcome: 운영 액션 (OC 생성 여부 등)
+        
+        Orchestrator(Judgment AI)는 이를 ReasonCodes로 변환하여 Decision을 내림.
+        """
         codes = []
         
-        # Safety Outcome 분석
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 1. Safety Outcome → ReasonCode
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         safety = outcome_label.get("safety_outcome", "")
         if safety == "HIGH_RISK":
             codes.append(ReasonCode.SAFETY_CONCERN)
         elif safety == "SENSITIVE":
             codes.append(ReasonCode.SENSITIVE_TOPIC)
-        elif safety == "NORMAL":
+        elif safety == "SAFE":
             codes.append(ReasonCode.SAFE_CONTENT)
         
-        # Response Outcome 분석
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 2. Response Outcome → ReasonCode
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         response = outcome_label.get("response_outcome", "")
         if response == "ANSWERED_GROUNDED":
             codes.append(ReasonCode.FAQ_GROUNDED)
@@ -248,23 +273,44 @@ class OrchestratorService:
             codes.append(ReasonCode.MISSING_INFORMATION)
         elif response == "CLOSING_MESSAGE":
             codes.append(ReasonCode.CLOSING_MESSAGE)
+        elif response == "ASK_CLARIFY":
+            # 명확화 요청 = 정보 부족한 상태
+            codes.append(ReasonCode.MISSING_INFORMATION)
+        elif response == "GENERAL_RESPONSE":
+            # 일반 응답 = FAQ 기반 아님, 추가 분석 필요
+            pass
         
-        # Confidence 분석
-        confidence = outcome_label.get("confidence", 0)
-        if confidence >= 0.85:
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 3. Quality Outcome → ReasonCode (신뢰도)
+        #    
+        #    QualityOutcome은 "검토 강도"를 의미하며, 이는 곧 AI의 자신감(confidence)
+        #    - OK_TO_SEND: 높은 신뢰도 (FAQ 기반, 명확한 답변)
+        #    - REVIEW_REQUIRED: 중간 신뢰도 (검토 권장)
+        #    - LOW_CONFIDENCE: 낮은 신뢰도 (정보 부족, 추정 많음)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        quality = outcome_label.get("quality_outcome", "")
+        if quality == "OK_TO_SEND":
             codes.append(ReasonCode.HIGH_CONFIDENCE)
-        elif confidence < 0.6:
+        elif quality == "LOW_CONFIDENCE":
             codes.append(ReasonCode.LOW_CONFIDENCE)
+        # REVIEW_REQUIRED는 중립 (HIGH도 LOW도 아님)
         
-        # Commitment 분석
-        if outcome_label.get("has_new_commitment"):
-            codes.append(ReasonCode.NEW_COMMITMENT)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 4. Operational Outcome → ReasonCode
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        operational = outcome_label.get("operational_outcome", [])
+        if isinstance(operational, list):
+            if "OC_CREATED" in operational or "OC_UPDATED" in operational:
+                codes.append(ReasonCode.NEW_COMMITMENT)
         
-        # Topic 분석
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 5. Topic 분석 (민감 토픽)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         topics = outcome_label.get("topics", [])
         sensitive_topics = {"refund", "compensation", "complaint", "safety", "legal"}
         if any(t.lower() in sensitive_topics for t in topics):
-            codes.append(ReasonCode.SENSITIVE_TOPIC)
+            if ReasonCode.SENSITIVE_TOPIC not in codes:
+                codes.append(ReasonCode.SENSITIVE_TOPIC)
         
         return codes
     
@@ -456,10 +502,17 @@ class OrchestratorService:
                 return False
         
         # ─────────────────────────────────────────────────────
-        # 6. confidence_min 체크
+        # 6. confidence_min 체크 (QualityOutcome 기반)
         # ─────────────────────────────────────────────────────
         if "confidence_min" in conditions and evidence.outcome_label:
-            confidence = evidence.outcome_label.get("confidence", 0)
+            quality = evidence.outcome_label.get("quality_outcome", "")
+            # QualityOutcome → 수치 변환
+            quality_to_confidence = {
+                "OK_TO_SEND": 0.85,
+                "REVIEW_REQUIRED": 0.65,
+                "LOW_CONFIDENCE": 0.4,
+            }
+            confidence = quality_to_confidence.get(quality, 0.5)
             if confidence < conditions["confidence_min"]:
                 return False
         
@@ -473,6 +526,88 @@ class OrchestratorService:
         # 모든 조건 통과
         logger.info(f"Pattern {pattern.name} matched!")
         return True
+    
+    # ─────────────────────────────────────────────────────
+    # 안전장치 체크 (GLOBAL_SAFETY_GUARD)
+    # ─────────────────────────────────────────────────────
+    
+    def _check_safety_guard(
+        self,
+        evidence: EvidencePackage,
+        reason_codes: List[ReasonCode],
+    ) -> bool:
+        """
+        전역 안전장치 체크 (GLOBAL_SAFETY_GUARD 패턴 사용)
+        
+        Returns:
+            bool: 안전장치 통과 여부
+        """
+        # GLOBAL_SAFETY_GUARD 패턴 조회
+        stmt = select(AutomationPattern).where(
+            AutomationPattern.name == "GLOBAL_SAFETY_GUARD",
+            AutomationPattern.is_active == True,
+        )
+        guard = self._db.execute(stmt).scalar_one_or_none()
+        
+        if not guard:
+            logger.warning("GLOBAL_SAFETY_GUARD 패턴이 없음 - 안전장치 체크 스킵")
+            return False
+        
+        # 패턴 조건으로 안전장치 체크
+        return self._matches_pattern(evidence, guard, reason_codes)
+    
+    # ─────────────────────────────────────────────────────
+    # FAQ Stats 기반 AUTO_SEND 자격 체크
+    # ─────────────────────────────────────────────────────
+    
+    def _check_faq_stats_eligible(
+        self,
+        evidence: EvidencePackage,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        property_faq_auto_send_stats 기반 AUTO_SEND 자격 확인
+        
+        Returns:
+            매칭된 stats 정보 또는 None
+        """
+        if not evidence.property_code:
+            return None
+        
+        if not evidence.outcome_label:
+            return None
+        
+        # faq_key 결정: used_faq_keys가 있으면 첫 번째, 없으면 response_outcome
+        used_faq_keys = evidence.outcome_label.get("used_faq_keys", [])
+        if used_faq_keys and len(used_faq_keys) > 0:
+            faq_key = used_faq_keys[0]  # 첫 번째 키 사용
+        else:
+            faq_key = evidence.outcome_label.get("response_outcome", "")
+        
+        if not faq_key:
+            return None
+        
+        # property_faq_auto_send_stats 조회
+        stmt = select(PropertyFaqAutoSendStats).where(
+            PropertyFaqAutoSendStats.property_code == evidence.property_code,
+            PropertyFaqAutoSendStats.faq_key == faq_key,
+            PropertyFaqAutoSendStats.eligible_for_auto_send == True,
+        )
+        stats = self._db.execute(stmt).scalar_one_or_none()
+        
+        if stats:
+            logger.info(
+                f"FAQ Stats eligible: property={evidence.property_code}, "
+                f"faq_key={faq_key}, approval_rate={stats.approval_rate:.2%}"
+            )
+            return {
+                "id": str(stats.id),
+                "property_code": stats.property_code,
+                "faq_key": stats.faq_key,
+                "approval_rate": stats.approval_rate,
+                "total_count": stats.total_count,
+            }
+        
+        return None
     
     # ─────────────────────────────────────────────────────
     # 충돌 검사
@@ -520,34 +655,52 @@ class OrchestratorService:
         evidence: EvidencePackage,
         reason_codes: List[ReasonCode],
     ) -> float:
-        """신뢰도 계산"""
+        """
+        신뢰도 계산
+        
+        신뢰도는 DecisionLog에 기록되며, 향후 분석에 사용됨.
+        ReasonCodes를 기반으로 계산 (이미 OutcomeLabel이 ReasonCodes로 변환됨)
+        """
         base = 0.5
         
-        # Outcome Label 신뢰도
-        if evidence.outcome_label:
-            label_confidence = evidence.outcome_label.get("confidence", 0.5)
-            base = (base + label_confidence) / 2
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # QualityOutcome 기반 기본 신뢰도
+        # (이미 ReasonCode로 변환되어 있음)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if ReasonCode.HIGH_CONFIDENCE in reason_codes:
+            base = 0.85
+        elif ReasonCode.LOW_CONFIDENCE in reason_codes:
+            base = 0.4
+        else:
+            # REVIEW_REQUIRED (중간)
+            base = 0.65
         
-        # Positive codes
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Positive codes로 신뢰도 상승
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         positive_codes = {
             ReasonCode.FAQ_GROUNDED,
             ReasonCode.PROFILE_GROUNDED,
-            ReasonCode.HIGH_CONFIDENCE,
             ReasonCode.SAFE_CONTENT,
             ReasonCode.SIMPLE_INQUIRY,
             ReasonCode.CLOSING_MESSAGE,
         }
+        # HIGH_CONFIDENCE는 이미 base에 반영되었으므로 제외
         positive_count = sum(1 for c in reason_codes if c in positive_codes)
-        base += positive_count * 0.1
+        base += positive_count * 0.05
         
-        # Negative codes
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Negative codes로 신뢰도 하락
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         negative_codes = {
-            ReasonCode.LOW_CONFIDENCE,
             ReasonCode.MISSING_INFORMATION,
             ReasonCode.SENSITIVE_TOPIC,
+            ReasonCode.NEW_COMMITMENT,
+            ReasonCode.FINANCIAL_MENTION,
         }
+        # LOW_CONFIDENCE는 이미 base에 반영되었으므로 제외
         negative_count = sum(1 for c in reason_codes if c in negative_codes)
-        base -= negative_count * 0.15
+        base -= negative_count * 0.1
         
         return max(0.0, min(1.0, base))
     
@@ -598,6 +751,8 @@ class OrchestratorService:
         pattern_match: Optional[Dict[str, Any]],
         has_conflicts: bool,
         confidence: float,
+        safety_guard_passed: bool = False,
+        faq_stats_match: Optional[Dict[str, Any]] = None,
     ) -> Decision:
         """최종 Decision 산출"""
         
@@ -613,22 +768,34 @@ class OrchestratorService:
             return Decision.BLOCK
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 2. AUTO_SEND: 패턴 매칭 + 자동 승인
+        # 2. AUTO_SEND: 안전장치 통과 + FAQ Stats eligible
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if pattern_match and pattern_match.get("is_auto_approved"):
-            # 추가 안전 체크
-            dangerous_for_auto = {
-                ReasonCode.SENSITIVE_TOPIC,
-                ReasonCode.COMPLAINT_DETECTED,
-                ReasonCode.NEW_COMMITMENT,
-                ReasonCode.FINANCIAL_MENTION,
-            }
-            if not any(code in dangerous_for_auto for code in reason_codes):
-                if confidence >= 0.7:  # 최소 70% 신뢰도
-                    return Decision.AUTO_SEND
+        if safety_guard_passed and faq_stats_match:
+            logger.info(
+                f"AUTO_SEND 조건 충족: safety_guard=PASS, "
+                f"faq_key={faq_stats_match.get('faq_key')}, "
+                f"approval_rate={faq_stats_match.get('approval_rate', 0):.2%}"
+            )
+            return Decision.AUTO_SEND
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 3. REQUIRE_EDIT: 수정이 필요한 경우
+        # 3. (하위 호환) 기존 패턴 매칭 방식 AUTO_SEND
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if pattern_match and pattern_match.get("is_auto_approved"):
+            # GLOBAL_SAFETY_GUARD가 아닌 다른 패턴인 경우 (하위 호환)
+            if pattern_match.get("name") != "GLOBAL_SAFETY_GUARD":
+                dangerous_for_auto = {
+                    ReasonCode.SENSITIVE_TOPIC,
+                    ReasonCode.COMPLAINT_DETECTED,
+                    ReasonCode.NEW_COMMITMENT,
+                    ReasonCode.FINANCIAL_MENTION,
+                }
+                if not any(code in dangerous_for_auto for code in reason_codes):
+                    if confidence >= 0.7:
+                        return Decision.AUTO_SEND
+        
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 4. REQUIRE_EDIT: 수정이 필요한 경우
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         edit_codes = {
             ReasonCode.PERSONAL_INFO,
@@ -638,7 +805,7 @@ class OrchestratorService:
             return Decision.REQUIRE_EDIT
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 4. REQUIRE_REVIEW: 검토가 필요한 경우
+        # 5. REQUIRE_REVIEW: 검토가 필요한 경우
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         review_codes = {
             ReasonCode.SENSITIVE_TOPIC,
@@ -674,11 +841,21 @@ class OrchestratorService:
         required_fields: List[str],
         commitment_conflicts: List[Dict[str, Any]],
         pattern_match: Optional[Dict[str, Any]],
+        faq_stats_match: Optional[Dict[str, Any]] = None,
     ) -> DecisionResult:
         """결과 생성 및 DB 로깅"""
         
         matched_pattern_id = pattern_match["id"] if pattern_match else None
         matched_pattern_name = pattern_match["name"] if pattern_match else None
+        
+        # FAQ Stats 매칭 정보 추가
+        faq_stats_info = None
+        if faq_stats_match:
+            faq_stats_info = {
+                "faq_key": faq_stats_match.get("faq_key"),
+                "approval_rate": faq_stats_match.get("approval_rate"),
+                "total_count": faq_stats_match.get("total_count"),
+            }
         
         # Decision Log 생성
         log = DecisionLog(
@@ -693,6 +870,7 @@ class OrchestratorService:
             decision_details={
                 "warnings": warnings,
                 "conflicts": commitment_conflicts,
+                "faq_stats": faq_stats_info,
             },
             confidence=confidence,
             pattern_id=matched_pattern_id,
@@ -703,7 +881,7 @@ class OrchestratorService:
         
         logger.info(
             f"Decision: {decision.value}, confidence={confidence:.2f}, "
-            f"pattern={matched_pattern_name}, log_id={log.id}"
+            f"pattern={matched_pattern_name}, faq_stats={faq_stats_info}, log_id={log.id}"
         )
         
         return DecisionResult(

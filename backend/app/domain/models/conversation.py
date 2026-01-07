@@ -49,6 +49,7 @@ class SafetyStatus(str, enum.Enum):
 
 class SendAction(str, enum.Enum):
     send = "send"
+    auto_sent = "auto_sent"
 
 
 class Conversation(Base):

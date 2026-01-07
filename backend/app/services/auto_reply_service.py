@@ -42,11 +42,12 @@ logger = logging.getLogger(__name__)
 
 class ResponseOutcome(str, Enum):
     """답변 방식"""
-    ANSWERED_GROUNDED = "ANSWERED_GROUNDED"  # 제공된 정보로 명확히 답함
+    ANSWERED_GROUNDED = "ANSWERED_GROUNDED"  # 제공된 정보로 명확히 답함 (used_faq_keys 필수)
     DECLINED_BY_POLICY = "DECLINED_BY_POLICY"  # 정책상 불가/제한 안내
     NEED_FOLLOW_UP = "NEED_FOLLOW_UP"  # "확인 후 안내"로 마무리
     ASK_CLARIFY = "ASK_CLARIFY"  # 게스트에게 추가 질문 요청
     CLOSING_MESSAGE = "CLOSING_MESSAGE"  # 종료/감사 인사 응답
+    GENERAL_RESPONSE = "GENERAL_RESPONSE"  # property_profiles 참고 없이 일반 응대
 
 
 class OperationalOutcome(str, Enum):
@@ -564,7 +565,7 @@ OUTPUT FORMAT
 {
   "reply_text": "게스트에게 보낼 최종 답장",
   "outcome": {
-    "response_outcome": "ANSWERED_GROUNDED | DECLINED_BY_POLICY | NEED_FOLLOW_UP | ASK_CLARIFY | CLOSING_MESSAGE",
+    "response_outcome": "ANSWERED_GROUNDED | DECLINED_BY_POLICY | NEED_FOLLOW_UP | ASK_CLARIFY | CLOSING_MESSAGE | GENERAL_RESPONSE",
     "operational_outcome": ["NO_OP_ACTION"],
     "safety_outcome": "SAFE | SENSITIVE | HIGH_RISK",
     "quality_outcome": "OK_TO_SEND | REVIEW_REQUIRED | LOW_CONFIDENCE"
@@ -580,13 +581,24 @@ OUTPUT FORMAT
   정보를 참고하지 않았으면 빈 배열 []
 
 outcome 기준:
-- ANSWERED_GROUNDED: 제공된 정보로 명확히 답함 (used_faq_keys 필수)
+- ANSWERED_GROUNDED: PROPERTY_INFO 또는 FAQ_ENTRIES 정보를 참고하여 구체적으로 답함
+  → 반드시 used_faq_keys에 참고한 컬럼/키를 명시해야 함
+  → used_faq_keys가 비어있으면 ANSWERED_GROUNDED 사용 불가
+- GENERAL_RESPONSE: property_profiles 참고 없이 일반적인 응대/확인
+  → "네 확인했습니다", "알겠습니다", "좋은 시간 되세요" 등 정보 참고 불필요한 응대
+  → used_faq_keys는 빈 배열 []
 - DECLINED_BY_POLICY: 정책상 불가/제한 안내
 - NEED_FOLLOW_UP: 정보 부족으로 "확인 후 안내"
 - ASK_CLARIFY: 게스트에게 추가 질문 요청
 - CLOSING_MESSAGE: 종료/감사/퇴실 인사에 대한 응답 (used_faq_keys 불필요)
 - SENSITIVE: 불만/클레임 가능성
 - HIGH_RISK: 환불/보상/법적/안전 이슈 → REVIEW_REQUIRED 필수
+
+⚠️ ANSWERED_GROUNDED vs GENERAL_RESPONSE vs CLOSING_MESSAGE 구분:
+- "체크인은 3시입니다" → ANSWERED_GROUNDED (checkin_time 참고)
+- "네 입금 확인했습니다" → GENERAL_RESPONSE (정보 참고 없음, 단순 확인 응대)
+- "예약 변경 요청 확인했습니다" → GENERAL_RESPONSE (정보 참고 없음, 단순 확인 응대)
+- "좋은 시간 되세요", "감사합니다" → CLOSING_MESSAGE (종료/감사 인사)
 
 ⚠️ CLOSING_MESSAGE 판단 기준:
 게스트가 "감사합니다", "잘 쉬었어요", "퇴실했습니다", "나왔어요", "좋았어요" 등
@@ -934,7 +946,7 @@ RESERVATION_STATUS: {reservation_status}
     def _create_closing_suggestion(self, message_id: int, locale: str) -> DraftSuggestion:
         """종료 인사에 대한 간단 응답"""
         if locale.startswith("ko"):
-            reply_text = "감사합니다! 남은 일정도 행복만 가득하시길 기도하겠습니다 : ! 추가로 필요한 게 있으시면 언제든 말씀해주세요! 😊"
+            reply_text = "감사합니다! 남은 일정 간 행복만 가득하시길 기도하겠습니다 :) ! 추가로 필요한 게 있으시면 언제든 말씀해주세요! 😊"
         else:
             reply_text = "Thank you! Please let us know if you need anything else. 😊"
         

@@ -456,11 +456,11 @@ async def _gmail_ingest_async():
     
     db = SessionLocal()
     try:
-        # 1) Gmail 파싱 (최근 3일, 최대 50개)
+        # 1) Gmail 파싱 (최근 3일, 최대 15개)
         logger.info("[Step 1/5] Gmail API에서 메일 가져오는 중...")
         parsed_messages = fetch_and_parse_recent_airbnb_messages(
             db=db,
-            max_results=20,
+            max_results=15,
             newer_than_days=3,
         )
         total_parsed = len(parsed_messages)
@@ -798,7 +798,7 @@ async def _attempt_auto_send(
     from app.adapters.gmail_send_adapter import GmailSendAdapter
     from app.services.gmail_fetch_service import get_gmail_service
     from app.services.send_event_handler import SendEventHandler
-    from app.domain.models.conversation import ConversationStatus, SendAction
+    from app.domain.models.conversation import ConversationStatus, SendAction, SendActionLog
     from app.services.orchestrator_core import HumanAction
     
     try:
@@ -833,6 +833,17 @@ async def _attempt_auto_send(
             # Conversation 상태 업데이트
             conv.status = ConversationStatus.sent
             conv.send_action = SendAction.auto_sent
+            
+            # ✅ SendActionLog 생성 (auto_sent 기록)
+            send_log = SendActionLog(
+                conversation_id=conv.id,
+                airbnb_thread_id=conv.airbnb_thread_id,
+                property_code=conv.property_code or "",
+                actor="system",
+                action=SendAction.auto_sent,
+                content_sent=content,
+            )
+            db.add(send_log)
             
             # SendEventHandler로 후처리 (Commitment + Embedding)
             send_handler = SendEventHandler(db)
@@ -886,7 +897,7 @@ async def _attempt_auto_send(
         return False
 
 
-def start_scheduler(interval_minutes: int = 5):
+def start_scheduler(interval_minutes: int = 2):
     """
     스케줄러 시작
     
@@ -901,7 +912,7 @@ def start_scheduler(interval_minutes: int = 5):
     
     _scheduler = AsyncIOScheduler()
     
-    # Gmail Ingest Job 등록 (5분 간격)
+    # Gmail Ingest Job 등록 (2분 간격)
     _scheduler.add_job(
         gmail_ingest_job,
         trigger=IntervalTrigger(minutes=interval_minutes),

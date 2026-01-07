@@ -13,7 +13,6 @@ from app.api.v1 import (
     conversations,
     bulk_send,
     commitments,
-    test_oc,  # 테스트용
     properties,  # 숙소 관리
     dashboard,  # 대시보드
     analytics,  # 분석
@@ -53,9 +52,6 @@ api_router.include_router(calendar.router)
 # ✅ Notifications (알림)
 api_router.include_router(notifications.router)
 
-# 🧪 Test API (Production에서 제거)
-api_router.include_router(test_oc.router)
-
 # ✅ Push Notification API
 api_router.include_router(push.router)
 
@@ -94,7 +90,7 @@ def get_scheduler_status():
     
     return SchedulerStatusResponse(
         running=scheduler.running,
-        interval_minutes=5,
+        interval_minutes=2,
         next_run=next_run,
     )
 

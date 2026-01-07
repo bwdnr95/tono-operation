@@ -22,6 +22,7 @@ from app.domain.models.conversation import (
     ConversationStatus,
     SafetyStatus,
     SendAction,
+    SendActionLog,
 )
 from app.domain.models.incoming_message import IncomingMessage, MessageDirection
 from app.domain.models.reservation_info import ReservationInfo
@@ -122,6 +123,14 @@ def list_conversations(
             .where(ReservationInfo.airbnb_thread_id == r.airbnb_thread_id)
         ).scalar_one_or_none()
         
+        # 마지막 send_action 조회
+        last_send_log = db.execute(
+            select(SendActionLog)
+            .where(SendActionLog.conversation_id == r.id)
+            .order_by(desc(SendActionLog.created_at))
+            .limit(1)
+        ).scalar_one_or_none()
+        
         items.append(ConversationListItemDTO(
             id=r.id,
             channel=r.channel.value,
@@ -136,6 +145,7 @@ def list_conversations(
             checkin_date=str(reservation.checkin_date) if reservation and reservation.checkin_date else None,
             checkout_date=str(reservation.checkout_date) if reservation and reservation.checkout_date else None,
             reservation_status=reservation.status if reservation else None,
+            last_send_action=last_send_log.action.value if last_send_log else None,
         ))
     
     return ConversationListResponse(items=items, next_cursor=next_cursor)
@@ -697,7 +707,7 @@ async def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Dep
 # ============================================================
 
 class GmailIngestRequest(BaseModel):
-    max_results: int = 50
+    max_results: int = 15
     newer_than_days: int = 3
 
 
