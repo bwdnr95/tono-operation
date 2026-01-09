@@ -597,7 +597,13 @@ async def _gmail_ingest_async():
             safety, _ = guard.evaluate_text(text=content)
             
             # Draft 저장 (게스트 메시지 스냅샷 포함)
-            guest_message_snapshot = last_guest_msg.pure_guest_message if last_guest_msg else None
+            # suggestion.guest_message: 병합된 연속 메시지 (LLM에 실제 들어간 입력)
+            # fallback: 마지막 게스트 메시지
+            guest_message_snapshot = (
+                suggestion.guest_message
+                if suggestion and suggestion.guest_message
+                else (last_guest_msg.pure_guest_message if last_guest_msg else None)
+            )
             draft = draft_service.upsert_latest(
                 conversation=conv,
                 content=content,

@@ -112,6 +112,9 @@ class DraftSuggestion:
     
     # Human Override (초기에는 None)
     human_override: Optional[Dict[str, Any]] = None
+    
+    # LLM에 실제 들어간 게스트 메시지 (연속 메시지 병합된 상태)
+    guest_message: Optional[str] = None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -208,7 +211,7 @@ class AutoReplyService:
         # 종료 인사 감지 → 간단 응답 (현재 메시지만으로 판단)
         closing = await self.closing_detector.detect(current_message)
         if closing.is_closing:
-            return self._create_closing_suggestion(message_id, locale)
+            return self._create_closing_suggestion(message_id, locale, current_message)
 
         # 1) Context 구성 (Conversation-first)
         context = self._build_conversation_context(
@@ -235,6 +238,7 @@ class AutoReplyService:
             reply_text=llm_result["reply_text"],
             outcome_label=final_outcome,
             generation_mode="llm",
+            guest_message=guest_message,  # 병합된 게스트 메시지 포함
         )
 
     # ══════════════════════════════════════════════════════════════
@@ -943,7 +947,7 @@ RESERVATION_STATUS: {reservation_status}
     # Fallback & Utilities
     # ══════════════════════════════════════════════════════════════
 
-    def _create_closing_suggestion(self, message_id: int, locale: str) -> DraftSuggestion:
+    def _create_closing_suggestion(self, message_id: int, locale: str, guest_message: str = "") -> DraftSuggestion:
         """종료 인사에 대한 간단 응답"""
         if locale.startswith("ko"):
             reply_text = "감사합니다! 남은 일정 간 행복만 가득하시길 기도하겠습니다 :) ! 추가로 필요한 게 있으시면 언제든 말씀해주세요! 😊"
@@ -962,6 +966,7 @@ RESERVATION_STATUS: {reservation_status}
             reply_text=reply_text,
             outcome_label=outcome_label,
             generation_mode="static_closing",
+            guest_message=guest_message,  # 종료 인사 메시지 포함
         )
 
     def _fallback_result(self, locale: str) -> Dict[str, Any]:
