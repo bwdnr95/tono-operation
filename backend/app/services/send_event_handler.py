@@ -76,6 +76,7 @@ class SendEventHandler:
         # 🆕 Few-shot Learning용 파라미터
         guest_message: Optional[str] = None,
         was_edited: bool = False,
+        pack_keys: Optional[List[str]] = None,  # 🆕 Answer Pack keys
     ) -> Tuple[List[Commitment], List[RiskSignal], List[OperationalCommitment]]:
         """
         메시지 발송 후 Commitment + OC + Embedding 처리
@@ -90,6 +91,7 @@ class SendEventHandler:
             guest_checkin_date: 게스트 체크인 날짜 (OC target_date 계산용)
             guest_message: 게스트 메시지 원문 (Few-shot Learning용)
             was_edited: AI 초안이 수정되었는지 여부 (Few-shot Learning용)
+            pack_keys: 사용된 Answer Pack keys (Few-shot 필터링용)
         
         Returns:
             (생성된 Commitment 목록, 생성된 RiskSignal 목록, 생성된 OC 목록)
@@ -121,10 +123,11 @@ class SendEventHandler:
                     was_edited=was_edited,
                     conversation_id=conversation_id,
                     airbnb_thread_id=airbnb_thread_id,
+                    pack_keys=pack_keys,  # 🆕 pack_keys 저장
                 )
                 logger.info(
                     f"SEND_EVENT_HANDLER: Stored answer embedding for airbnb_thread_id={airbnb_thread_id}, "
-                    f"was_edited={was_edited}"
+                    f"was_edited={was_edited}, pack_keys={pack_keys}"
                 )
             except Exception as e:
                 # Embedding 저장 실패해도 다른 처리는 계속 진행

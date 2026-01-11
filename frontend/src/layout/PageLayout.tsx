@@ -13,14 +13,14 @@ export const PageLayout: React.FC<PageLayoutProps> = ({
   rightHeader,
 }) => {
   return (
-    <div className="flex flex-col h-screen bg-slate-50">
+    <div className="flex flex-col h-screen" style={{ background: "var(--bg)" }}>
       {title && (
-        <header className="flex items-center justify-between px-6 py-4 border-b bg-white">
-          <h1 className="text-xl font-semibold text-slate-900">{title}</h1>
+        <header className="flex items-center justify-between px-6 py-4 border-b" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+          <h1 className="text-xl font-semibold" style={{ color: "var(--text)" }}>{title}</h1>
           <div>{rightHeader}</div>
         </header>
       )}
-      <main className="flex-1 overflow-hidden">{children}</main>
+      <main className="flex-1 overflow-auto">{children}</main>
     </div>
   );
 };

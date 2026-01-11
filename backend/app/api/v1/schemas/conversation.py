@@ -15,6 +15,7 @@ class ConversationListItemDTO(BaseModel):
     channel: str
     airbnb_thread_id: str
     property_code: Optional[str] = None  # 숙소 코드
+    group_code: Optional[str] = None  # 🆕 그룹 코드 (객실 배정 전일 수 있음)
     status: str
     safety_status: SafetyStatus
     is_read: bool = False  # 읽음/안읽음 상태
@@ -28,6 +29,9 @@ class ConversationListItemDTO(BaseModel):
     reservation_status: Optional[str] = None
     # 마지막 발송 액션 (send, auto_sent 등)
     last_send_action: Optional[str] = None
+    # 🆕 객실 재배정 관련
+    effective_group_code: Optional[str] = None  # 실제 적용되는 그룹 코드
+    can_reassign: bool = False  # 객실 재배정 가능 여부
 
 
 class ConversationDTO(ConversationListItemDTO):

@@ -54,6 +54,8 @@ async def gmail_ingest_job():
     
     실제 작업은 별도 스레드에서 실행하여 
     FastAPI event loop를 블로킹하지 않습니다.
+    
+    🆕 fire-and-forget 방식: await 없이 스레드에 위임하고 즉시 반환
     """
     global _job_running
     
@@ -65,13 +67,9 @@ async def gmail_ingest_job():
     _job_running = True
     logger.info("Gmail Ingest Job 시작 (별도 스레드로 위임)")
     
-    try:
-        # 별도 스레드에서 실행
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(_executor, _gmail_ingest_sync)
-    finally:
-        _job_running = False
-        logger.info("Gmail Ingest Job 완료 (플래그 해제)")
+    # 🆕 fire-and-forget: 스레드풀에 제출하고 즉시 반환
+    # 스레드 작업 완료 후 플래그 해제는 스레드 내에서 처리
+    _executor.submit(_gmail_ingest_sync_with_flag)
 
 
 # iCal 동기화 Job 실행 중 플래그
@@ -415,6 +413,18 @@ async def _ical_sync_async():
         db.close()
 
 
+def _gmail_ingest_sync_with_flag():
+    """
+    Gmail Ingest 작업 + 플래그 해제 (fire-and-forget용)
+    """
+    global _job_running
+    try:
+        _gmail_ingest_sync()
+    finally:
+        _job_running = False
+        logger.info("Gmail Ingest Job 완료 (플래그 해제)")
+
+
 def _gmail_ingest_sync():
     """
     Gmail Ingest 실제 작업 (별도 스레드에서 실행)
@@ -572,11 +582,15 @@ async def _gmail_ingest_async():
                     continue
             
             # LLM으로 Draft 생성
+            # property_code는 reservation_info에서 조회 (Single Source of Truth)
+            from app.services.property_resolver import PropertyResolver
+            resolved = PropertyResolver(db).resolve(airbnb_thread_id)
+            
             try:
                 suggestion = await auto_reply_service.suggest_reply_for_message(
                     message_id=last_guest_msg.id,
                     locale="ko",
-                    property_code=last_guest_msg.property_code,
+                    property_code=resolved.property_code,  # reservation_info 기반
                 )
                 
                 if suggestion and suggestion.reply_text:
@@ -623,13 +637,33 @@ async def _gmail_ingest_async():
                     guest_name = last_guest_msg.guest_name if last_guest_msg else "게스트"
                     message_preview = (last_guest_msg.pure_guest_message or "")[:150] if last_guest_msg else ""
                     notification_svc.create_safety_alert(
-                        property_code=conv.property_code or "",
+                        property_code=resolved.property_code or "",  # reservation_info 기반
                         guest_name=guest_name or "게스트",
                         message_preview=message_preview,
                         airbnb_thread_id=conv.airbnb_thread_id,
                     )
                 except Exception as e:
                     logger.warning("Failed to create safety alert notification: %s", e)
+            
+            # ✅ 입금/결제 확인 필요 알림 생성 (Rule Correction에서 감지된 경우)
+            if outcome_label and outcome_label.get("rule_applied"):
+                rules = outcome_label.get("rule_applied", [])
+                has_payment_keyword = any("payment_keyword" in rule for rule in rules)
+                
+                if has_payment_keyword:
+                    try:
+                        notification_svc = NotificationService(db)
+                        guest_name = last_guest_msg.guest_name if last_guest_msg else "게스트"
+                        message_preview = (last_guest_msg.pure_guest_message or "")[:150] if last_guest_msg else ""
+                        notification_svc.create_payment_verification_alert(
+                            property_code=resolved.property_code or "",
+                            guest_name=guest_name or "게스트",
+                            message_preview=message_preview,
+                            airbnb_thread_id=conv.airbnb_thread_id,
+                        )
+                        logger.info(f"  [{idx}] {short_tid} → 💰 입금 확인 알림 생성")
+                    except Exception as e:
+                        logger.warning("Failed to create payment verification alert: %s", e)
             
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # ✅ Orchestrator 판단 및 AUTO_SEND
@@ -646,7 +680,7 @@ async def _gmail_ingest_async():
                     evidence = EvidencePackage(
                         draft_reply_id=draft.id,
                         conversation_id=conv.id,
-                        property_code=conv.property_code,
+                        property_code=resolved.property_code,  # reservation_info 기반
                         draft_content=content,
                         guest_message=last_guest_msg.pure_guest_message,
                         outcome_label=outcome_label,
@@ -717,8 +751,15 @@ async def _gmail_ingest_async():
                 logger.info(f"  [{idx}] {short_tid} → suggestion 또는 outcome_label 없음, 스킵")
             
             stats["draft_created"] += 1
+            
+            # 🆕 각 conversation 처리 후 중간 commit (DB 연결 점유 시간 최소화)
+            try:
+                db.commit()
+            except Exception as e:
+                logger.warning(f"  [{idx}] {short_tid} → 중간 commit 실패: {e}")
+                db.rollback()
         
-        db.commit()
+        # 최종 commit (이미 중간에 했지만 safety net)
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 미응답 경고 알림 생성 (30분 이상)
@@ -749,8 +790,11 @@ async def _gmail_ingest_async():
                 if last_guest and last_guest.received_at < cutoff:
                     minutes_unanswered = int((now_utc - last_guest.received_at).total_seconds() / 60)
                     notification_svc = NotificationService(db)
+                    # property_code는 reservation_info에서 조회
+                    from app.services.property_resolver import get_effective_property_code
+                    effective_prop = get_effective_property_code(db, conv.airbnb_thread_id)
                     result = notification_svc.create_unanswered_warning(
-                        property_code=conv.property_code or "",
+                        property_code=effective_prop or "",
                         guest_name=last_guest.guest_name or "게스트",
                         minutes_unanswered=minutes_unanswered,
                         airbnb_thread_id=conv.airbnb_thread_id,
@@ -779,6 +823,19 @@ async def _gmail_ingest_async():
         logger.info(f"  LLM 실패 (Template 사용): {stats['llm_failed']}개")
         logger.info("=" * 60)
         
+        # ✅ WebSocket 브로드캐스트: 프론트엔드에 새로고침 알림
+        try:
+            from app.services.ws_manager import ws_manager
+            # 변경사항이 있을 때만 브로드캐스트
+            if stats['draft_created'] > 0 or stats['auto_sent'] > 0:
+                sent_count = await ws_manager.broadcast_refresh(
+                    scope="conversations",
+                    reason="scheduler"
+                )
+                logger.info(f"  📡 WebSocket 브로드캐스트 완료 ({sent_count}개 클라이언트)")
+        except Exception as e:
+            logger.warning(f"WebSocket 브로드캐스트 실패 (무시됨): {e}")
+        
     except Exception as e:
         logger.error(f"Gmail Ingest Job 실패: {e}")
         logger.exception("상세 에러:")
@@ -801,11 +858,17 @@ async def _attempt_auto_send(
     Returns:
         bool: 발송 성공 여부
     """
+    from sqlalchemy import select, desc
     from app.adapters.gmail_send_adapter import GmailSendAdapter
     from app.services.gmail_fetch_service import get_gmail_service
     from app.services.send_event_handler import SendEventHandler
     from app.domain.models.conversation import ConversationStatus, SendAction, SendActionLog
+    from app.domain.models.incoming_message import IncomingMessage
     from app.services.orchestrator_core import HumanAction
+    from app.services.property_resolver import get_effective_property_code
+    
+    # property_code는 reservation_info에서 조회 (Single Source of Truth)
+    effective_property_code = get_effective_property_code(db, conv.airbnb_thread_id) or ""
     
     try:
         # Gmail 서비스 확인
@@ -814,66 +877,82 @@ async def _attempt_auto_send(
             logger.warning("AUTO_SEND 실패: Gmail 서비스 없음")
             return False
         
-        send_adapter = GmailSendAdapter(gmail_service)
+        send_adapter = GmailSendAdapter(service=gmail_service)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # incoming_messages에서 reply_to, gmail_thread_id, subject 조회
+        # (conversations 테이블에는 이 컬럼들이 없음)
+        # ═══════════════════════════════════════════════════════════════
+        last_incoming_msg = db.execute(
+            select(IncomingMessage)
+            .where(IncomingMessage.airbnb_thread_id == conv.airbnb_thread_id)
+            .where(IncomingMessage.direction == "incoming")
+            .order_by(desc(IncomingMessage.received_at))
+            .limit(1)
+        ).scalar_one_or_none()
+        
+        if not last_incoming_msg:
+            logger.warning(f"AUTO_SEND 실패: incoming_message 없음 (thread={conv.airbnb_thread_id[:30]}...)")
+            return False
+        
+        reply_to = last_incoming_msg.reply_to
+        gmail_thread_id = last_incoming_msg.gmail_thread_id
+        email_subject = last_incoming_msg.subject
         
         # Reply-To 확인
-        reply_to = conv.reply_to_email
         if not reply_to:
-            logger.warning("AUTO_SEND 실패: Reply-To 없음")
+            logger.warning(f"AUTO_SEND 실패: Reply-To 없음 (thread={conv.airbnb_thread_id[:30]}...)")
+            return False
+        
+        # Gmail thread ID 확인
+        if not gmail_thread_id:
+            logger.warning(f"AUTO_SEND 실패: Gmail thread ID 없음 (thread={conv.airbnb_thread_id[:30]}...)")
             return False
         
         # 발송
-        message_id = send_adapter.send_reply(
-            to_address=reply_to,
-            subject=f"Re: {conv.email_subject or 'Airbnb Inquiry'}",
-            body=content,
+        resp = send_adapter.send_reply(
+            gmail_thread_id=gmail_thread_id,
+            to_email=reply_to,
+            subject=f"Re: {email_subject or 'Airbnb Inquiry'}",
+            reply_text=content,
             original_message_id=None,
-            in_reply_to=None,
         )
         
-        if message_id:
-            # Draft 상태 업데이트
-            draft.status = "sent"
-            draft.sent_at = datetime.utcnow()
+        if resp and resp.get("id"):
+            out_gmail_message_id = resp.get("id")
+            out_gmail_thread_id = resp.get("threadId")
             
             # Conversation 상태 업데이트
             conv.status = ConversationStatus.sent
-            conv.send_action = SendAction.auto_sent
             
             # ✅ SendActionLog 생성 (auto_sent 기록)
             send_log = SendActionLog(
                 conversation_id=conv.id,
                 airbnb_thread_id=conv.airbnb_thread_id,
-                property_code=conv.property_code or "",
+                property_code=effective_property_code,  # reservation_info 기반
                 actor="system",
                 action=SendAction.auto_sent,
                 content_sent=content,
+                payload_json={
+                    "auto_send": True,
+                    "gmail_thread_id": gmail_thread_id,
+                    "gmail_message_id": out_gmail_message_id,
+                },
             )
             db.add(send_log)
             
             # SendEventHandler로 후처리 (Commitment + Embedding)
             send_handler = SendEventHandler(db)
             
-            # 게스트 메시지 가져오기 (DraftReply의 스냅샷 우선)
+            # 게스트 메시지 가져오기 (DraftReply의 스냅샷 우선, 없으면 위에서 조회한 last_incoming_msg 사용)
             guest_message_for_embedding = draft.guest_message_snapshot or ""
-            if not guest_message_for_embedding:
-                # 스냅샷이 없으면 최근 게스트 메시지 조회
-                from app.domain.models.incoming_message import IncomingMessage
-                from sqlalchemy import select, desc
-                last_guest_msg = db.execute(
-                    select(IncomingMessage)
-                    .where(IncomingMessage.airbnb_thread_id == conv.airbnb_thread_id)
-                    .where(IncomingMessage.direction == "incoming")
-                    .order_by(desc(IncomingMessage.received_at))
-                    .limit(1)
-                ).scalar_one_or_none()
-                if last_guest_msg:
-                    guest_message_for_embedding = last_guest_msg.pure_guest_message or ""
+            if not guest_message_for_embedding and last_incoming_msg:
+                guest_message_for_embedding = last_incoming_msg.pure_guest_message or ""
             
             await send_handler.on_message_sent(
                 sent_text=content,
                 airbnb_thread_id=conv.airbnb_thread_id,
-                property_code=conv.property_code or "",
+                property_code=effective_property_code,  # reservation_info 기반
                 conversation_id=conv.id,
                 # Few-shot Learning용
                 guest_message=guest_message_for_embedding,

@@ -1,6 +1,6 @@
 // src/components/conversations/ConversationDetail.tsx
 import React from "react";
-import type { ConversationDetailDTO, ThreadMessageDTO } from "../../types/conversations";
+import type { ConversationDetailDTO, ThreadMessageDTO, SendActionLogDTO } from "../../types/conversations";
 import type { RiskSignalDTO, ConflictDTO } from "../../types/commitments";
 import { RiskSignalAlert, ConflictConfirmModal } from "./RiskSignalAlert";
 import { OutcomeLabelCard, SafetyBadge } from "./OutcomeLabelDisplay";
@@ -27,6 +27,42 @@ function formatDate(v: string | null | undefined) {
   }
 }
 
+// 발송 액션 표시 컴포넌트
+function SendActionBadge({ action }: { action: string }) {
+  if (action === "auto_sent") {
+    return (
+      <span 
+        className="badge badge-info" 
+        style={{ 
+          display: "inline-flex", 
+          alignItems: "center", 
+          gap: "4px",
+          background: "var(--primary-bg)",
+          color: "var(--primary)",
+        }}
+        title="AI가 자동으로 발송했습니다"
+      >
+        🤖 자동발송
+      </span>
+    );
+  }
+  if (action === "send") {
+    return (
+      <span className="badge badge-success" style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+        ✓ 수동발송
+      </span>
+    );
+  }
+  if (action === "bulk_send") {
+    return (
+      <span className="badge badge-default" style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+        📦 일괄발송
+      </span>
+    );
+  }
+  return <span className="badge badge-default">{action}</span>;
+}
+
 interface Props {
   detail: ConversationDetailDTO | null;
   loading: boolean;
@@ -48,6 +84,8 @@ interface Props {
   showConflictModal?: boolean;
   onConfirmSendWithConflict?: () => void;
   onCancelSendWithConflict?: () => void;
+  // 🆕 객실 배정
+  onOpenRoomAssignment?: () => void;
 }
 
 export function ConversationDetail(props: Props) {
@@ -72,6 +110,7 @@ export function ConversationDetail(props: Props) {
     showConflictModal = false,
     onConfirmSendWithConflict,
     onCancelSendWithConflict,
+    onOpenRoomAssignment,
   } = props;
 
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
@@ -109,9 +148,16 @@ export function ConversationDetail(props: Props) {
   const c = detail.conversation;
   const draft = detail.draft_reply;
   const messages = detail.messages || [];
+  const sendLogs = detail.send_logs || [];
+  const canReply = detail.can_reply ?? true;
+  const airbnbActionUrl = detail.airbnb_action_url;
 
-  // 발송 조건: draft 존재 + thread_id 일치 + safety가 block이 아님 + status가 ready_to_send 또는 blocked(재시도)
+  // 마지막 발송 액션 (있으면)
+  const lastSendLog = sendLogs.length > 0 ? sendLogs[0] : null;
+
+  // 발송 조건: draft 존재 + thread_id 일치 + safety가 block이 아님 + status가 ready_to_send 또는 blocked(재시도) + can_reply
   const canSend =
+    canReply &&
     !!draft?.id &&
     !!draft.airbnb_thread_id &&
     draft.airbnb_thread_id === c.airbnb_thread_id &&
@@ -122,6 +168,8 @@ export function ConversationDetail(props: Props) {
   const guestName = c.guest_name;
   const checkinDate = c.checkin_date;
   const checkoutDate = c.checkout_date;
+  const isInquiry = c.reservation_status === "inquiry";
+  const dateAvailability = detail.date_availability;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
@@ -136,15 +184,97 @@ export function ConversationDetail(props: Props) {
               <div>
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                   <span style={{ fontWeight: 600 }}>{guestName}</span>
-                  {c.property_code && (
-                    <span className="badge badge-primary" style={{ padding: "2px 8px", fontSize: "10px" }}>
-                      {c.property_code}
+                  {isInquiry && (
+                    <span className="badge" style={{ padding: "2px 8px", fontSize: "10px", background: "var(--primary-bg)", color: "var(--primary)" }}>
+                      💬 문의
                     </span>
                   )}
+                  {c.property_code ? (
+                    /* 객실 배정됨 - 클릭하면 변경 가능 */
+                    c.group_code ? (
+                      <button
+                        className="badge badge-primary"
+                        onClick={onOpenRoomAssignment}
+                        style={{ 
+                          padding: "2px 8px", 
+                          fontSize: "10px",
+                          cursor: "pointer",
+                          border: "none",
+                        }}
+                        title="클릭하여 객실 변경"
+                      >
+                        {c.property_code}
+                      </button>
+                    ) : (
+                      /* 그룹 없이 직접 매핑된 숙소 - 변경 불가 */
+                      <span className="badge badge-primary" style={{ padding: "2px 8px", fontSize: "10px" }}>
+                        {c.property_code}
+                      </span>
+                    )
+                  ) : c.group_code ? (
+                    /* 그룹 매핑이지만 객실 미배정 */
+                    <button
+                      className="badge"
+                      onClick={onOpenRoomAssignment}
+                      style={{ 
+                        padding: "2px 8px", 
+                        fontSize: "10px", 
+                        background: "var(--warning-bg)", 
+                        color: "var(--warning)",
+                        border: "1px dashed var(--warning)",
+                        cursor: "pointer",
+                      }}
+                    >
+                      🏠 객실 배정 필요
+                    </button>
+                  ) : null}
                 </div>
                 {checkinDate && checkoutDate && (
                   <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
                     {formatDate(checkinDate)} → {formatDate(checkoutDate)}
+                  </div>
+                )}
+                {/* 예약 가능 여부 표시 (INQUIRY 상태일 때) */}
+                {isInquiry && dateAvailability && (
+                  <div style={{ marginTop: "4px" }}>
+                    {dateAvailability.available ? (
+                      <span style={{ 
+                        display: "inline-flex", 
+                        alignItems: "center", 
+                        gap: "4px",
+                        padding: "2px 8px", 
+                        fontSize: "11px", 
+                        background: "var(--success-bg)", 
+                        color: "var(--success)",
+                        borderRadius: "4px",
+                      }}>
+                        ✅ 해당 날짜 예약 가능
+                      </span>
+                    ) : (
+                      <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+                        <span style={{ 
+                          display: "inline-flex", 
+                          alignItems: "center", 
+                          gap: "4px",
+                          padding: "2px 8px", 
+                          fontSize: "11px", 
+                          background: "var(--danger-bg)", 
+                          color: "var(--danger)",
+                          borderRadius: "4px",
+                        }}>
+                          ❌ 해당 날짜 예약 불가
+                        </span>
+                        {dateAvailability.conflicts.map((conflict, idx) => (
+                          <span key={idx} style={{ 
+                            fontSize: "10px", 
+                            color: "var(--danger)",
+                            marginLeft: "8px",
+                          }}>
+                            → {conflict.guest_name}님 ({formatDate(conflict.checkin_date)}~{formatDate(conflict.checkout_date)})
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -152,11 +282,47 @@ export function ConversationDetail(props: Props) {
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
               <span style={{ fontWeight: 600 }}>게스트</span>
-              {c.property_code && (
-                <span className="badge badge-primary" style={{ padding: "2px 8px", fontSize: "10px" }}>
-                  {c.property_code}
+              {isInquiry && (
+                <span className="badge" style={{ padding: "2px 8px", fontSize: "10px", background: "var(--primary-bg)", color: "var(--primary)" }}>
+                  💬 문의
                 </span>
               )}
+              {c.property_code ? (
+                c.group_code ? (
+                  <button
+                    className="badge badge-primary"
+                    onClick={onOpenRoomAssignment}
+                    style={{ 
+                      padding: "2px 8px", 
+                      fontSize: "10px",
+                      cursor: "pointer",
+                      border: "none",
+                    }}
+                    title="클릭하여 객실 변경"
+                  >
+                    {c.property_code}
+                  </button>
+                ) : (
+                  <span className="badge badge-primary" style={{ padding: "2px 8px", fontSize: "10px" }}>
+                    {c.property_code}
+                  </span>
+                )
+              ) : c.group_code ? (
+                <button
+                  className="badge"
+                  onClick={onOpenRoomAssignment}
+                  style={{ 
+                    padding: "2px 8px", 
+                    fontSize: "10px", 
+                    background: "var(--warning-bg)", 
+                    color: "var(--warning)",
+                    border: "1px dashed var(--warning)",
+                    cursor: "pointer",
+                  }}
+                >
+                  🏠 객실 배정 필요
+                </button>
+              ) : null}
             </div>
           )}
         </div>
@@ -164,9 +330,35 @@ export function ConversationDetail(props: Props) {
           <span className={`badge ${c.status === "ready_to_send" ? "badge-success" : c.status === "needs_review" ? "badge-warning" : c.status === "blocked" ? "badge-danger" : "badge-default"}`}>
             {c.status === "ready_to_send" ? "발송준비" : c.status === "needs_review" ? "검토필요" : c.status === "sent" ? "완료" : c.status === "blocked" ? "실패" : "대기"}
           </span>
+          {/* 발송 완료된 경우 발송 방식 표시 */}
+          {c.status === "sent" && lastSendLog && (
+            <SendActionBadge action={lastSendLog.action} />
+          )}
           <span className={`badge ${c.safety_status === "pass" ? "badge-success" : c.safety_status === "review" ? "badge-warning" : "badge-danger"}`}>
             {c.safety_status === "pass" ? "안전" : c.safety_status === "review" ? "검토" : "차단"}
           </span>
+          {/* 에어비앤비 링크 버튼 */}
+          {c.airbnb_thread_id && (
+            <a
+              href={`https://www.airbnb.co.kr/hosting/thread/${c.airbnb_thread_id}?thread_type=home_booking`}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="에어비앤비에서 대화 보기"
+              className="btn btn-ghost btn-sm"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+                color: "#FF385C",
+                textDecoration: "none",
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 0C5.373 0 0 5.373 0 12c0 5.623 3.872 10.328 9.092 11.63a.75.75 0 0 0 .908-.657c.13-.738.324-1.526.578-2.344a.75.75 0 0 0-.263-.795C8.047 18.06 6.5 15.193 6.5 12c0-3.038 2.462-5.5 5.5-5.5s5.5 2.462 5.5 5.5c0 3.193-1.547 6.06-3.815 7.834a.75.75 0 0 0-.263.795c.254.818.448 1.606.578 2.344a.75.75 0 0 0 .908.657C20.128 22.328 24 17.623 24 12c0-6.627-5.373-12-12-12z"/>
+              </svg>
+              Airbnb
+            </a>
+          )}
           {onMarkRead && (
             <button onClick={onMarkRead} className="btn btn-ghost btn-sm">
               처리완료
@@ -234,18 +426,60 @@ export function ConversationDetail(props: Props) {
             placeholder="답장을 입력하세요..."
             className="composer-textarea"
           />
-          <button
-            onClick={onSend}
-            disabled={sending || !canSend}
-            className="btn btn-primary composer-send"
-            title={!canSend ? "발송 조건: safety pass, status ready_to_send" : ""}
-          >
-            {sending ? "발송 중..." : "발송 →"}
-          </button>
+          {canReply ? (
+            <button
+              onClick={onSend}
+              disabled={sending || !canSend}
+              className="btn btn-primary composer-send"
+              title={!canSend ? "발송 조건: safety pass, status ready_to_send" : ""}
+            >
+              {sending ? "발송 중..." : "발송 →"}
+            </button>
+          ) : (
+            <a
+              href={airbnbActionUrl || "#"}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn composer-send"
+              style={{ 
+                background: "#ff385c", 
+                color: "white",
+                textDecoration: "none",
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                <polyline points="15,3 21,3 21,9" />
+                <line x1="10" y1="14" x2="21" y2="3" />
+              </svg>
+              에어비앤비
+            </a>
+          )}
         </div>
 
+        {/* 문의 단계 안내 */}
+        {!canReply && (
+          <div style={{ 
+            marginTop: "12px", 
+            padding: "12px", 
+            background: "var(--primary-bg)", 
+            borderRadius: "var(--radius)", 
+            color: "var(--primary)", 
+            fontSize: "13px",
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+          }}>
+            <span>💬</span>
+            <span>문의 단계에서는 에어비앤비에서 직접 답변해주세요. 예약 확정 후 TONO에서 자동 응답이 가능합니다.</span>
+          </div>
+        )}
+
         {error && (
-          <div style={{ marginTop: "12px", padding: "12px", background: "rgba(239,68,68,0.1)", borderRadius: "var(--radius)", color: "var(--danger)", fontSize: "13px" }}>
+          <div style={{ marginTop: "12px", padding: "12px", background: "var(--danger-bg)", borderRadius: "var(--radius)", color: "var(--danger)", fontSize: "13px" }}>
             {error}
           </div>
         )}

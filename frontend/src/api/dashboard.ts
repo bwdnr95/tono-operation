@@ -3,7 +3,7 @@
  * Dashboard API
  * - 대시보드 요약, 예약 요청, 미응답 메시지, Staff Alerts
  */
-import { apiGet } from "./client";
+import { apiGet, apiPatch } from "./client";
 
 import type {
   DashboardSummaryDTO,
@@ -40,6 +40,13 @@ export async function getPendingReservations(
   params?: GetPendingReservationsParams
 ): Promise<PendingReservationListResponse> {
   return apiGet<PendingReservationListResponse>("/dashboard/pending-requests", params);
+}
+
+// PATCH /api/v1/dashboard/pending-reservations/{id}/decline
+export async function declinePendingReservation(
+  reservationId: number
+): Promise<{ success: boolean; message: string }> {
+  return apiPatch(`/dashboard/pending-reservations/${reservationId}/decline`);
 }
 
 // ============================================================

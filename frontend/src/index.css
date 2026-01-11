@@ -3,9 +3,14 @@
 /* Pretendard */
 @import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css");
 
+/* Page-specific styles */
+@import "./styles/inbox.css";
+
+/* ===== Light Mode (Default) ===== */
 :root {
   /* Palette - Clean SaaS */
   --bg: #f5f5f7;
+  --bg-secondary: #eeeef0;
   --surface: #ffffff;
   --sidebar: #1a1a2e;
   --sidebar-hover: #252542;
@@ -19,9 +24,13 @@
 
   --primary: #6366f1;
   --primary-hover: #4f46e5;
+  --primary-bg: rgba(99, 102, 241, 0.1);
   --success: #10b981;
+  --success-bg: rgba(16, 185, 129, 0.1);
   --warning: #f59e0b;
+  --warning-bg: rgba(245, 158, 11, 0.1);
   --danger: #ef4444;
+  --danger-bg: rgba(239, 68, 68, 0.1);
 
   --border: #e5e7eb;
   --border-light: #f3f4f6;
@@ -37,6 +46,47 @@
   --radius: 8px;
   --radius-lg: 12px;
   --radius-xl: 16px;
+  
+  /* Overlay */
+  --overlay: rgba(255, 255, 255, 0.8);
+}
+
+/* ===== Dark Mode ===== */
+[data-theme="dark"] {
+  --bg: #0f0f12;
+  --bg-secondary: #18181b;
+  --surface: #1c1c21;
+  --sidebar: #0a0a0d;
+  --sidebar-hover: #1c1c21;
+  --sidebar-active: #252530;
+  
+  --text: #ffffff;
+  --text-secondary: #e4e4e7;
+  --text-muted: #b4b4bb;
+  --text-sidebar: #b4b4bb;
+  --text-sidebar-active: #ffffff;
+
+  --primary: #818cf8;
+  --primary-hover: #6366f1;
+  --primary-bg: #252547;
+  --success: #34d399;
+  --success-bg: #14332a;
+  --warning: #fbbf24;
+  --warning-bg: #3d2e0a;
+  --danger: #f87171;
+  --danger-bg: #3d1515;
+
+  --border: #3f3f46;
+  --border-light: #27272a;
+
+  /* Shadows - darker for dark mode */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -1px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -2px rgba(0, 0, 0, 0.3);
+  
+  /* Overlay */
+  --overlay: rgba(0, 0, 0, 0.8);
 }
 
 html, body, #root {
@@ -58,10 +108,10 @@ body {
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: #d1d5db;
+  background: var(--text-muted);
   border-radius: 3px;
 }
-::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
 
 /* ===== Layout ===== */
 .app-layout {
@@ -360,23 +410,28 @@ body {
 }
 
 .badge-primary {
-  background: rgba(99, 102, 241, 0.1);
+  background: var(--primary-bg);
   color: var(--primary);
 }
 
 .badge-success {
-  background: rgba(16, 185, 129, 0.1);
+  background: var(--success-bg);
   color: var(--success);
 }
 
 .badge-warning {
-  background: rgba(245, 158, 11, 0.1);
+  background: var(--warning-bg);
   color: var(--warning);
 }
 
 .badge-danger {
-  background: rgba(239, 68, 68, 0.1);
+  background: var(--danger-bg);
   color: var(--danger);
+}
+
+.badge-info {
+  background: var(--primary-bg);
+  color: var(--primary);
 }
 
 /* ===== Stats Card ===== */
@@ -596,11 +651,12 @@ body {
 .loading-overlay {
   position: absolute;
   inset: 0;
-  background: rgba(255, 255, 255, 0.8);
+  background: var(--overlay);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 10;
+  backdrop-filter: blur(4px);
 }
 
 .loading-spinner {
@@ -614,6 +670,17 @@ body {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+@keyframes slideIn {
+  from { 
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to { 
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* ===== Empty State ===== */
@@ -715,4 +782,2030 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* ===== Skeleton Loading ===== */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-secondary) 25%,
+    color-mix(in srgb, var(--bg-secondary) 50%, var(--bg)) 50%,
+    var(--bg-secondary) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite ease-in-out;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.skeleton-item {
+  pointer-events: none;
+}
+
+.skeleton-card {
+  pointer-events: none;
+}
+
+/* ===== Bounce Animation ===== */
+@keyframes bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+/* ===== Toast ===== */
+.toast-container {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  min-width: 320px;
+  max-width: 420px;
+  pointer-events: auto;
+  animation: toastSlideIn 0.3s ease;
+}
+
+.toast-exit {
+  animation: toastSlideOut 0.3s ease forwards;
+}
+
+@keyframes toastSlideIn {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes toastSlideOut {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+}
+
+.toast-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.toast-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.toast-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.toast-message {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.toast-close {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  font-size: 18px;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.15s ease;
+}
+
+.toast-close:hover {
+  background: var(--bg-secondary);
+  color: var(--text);
+}
+
+/* Toast Icons */
+.toast-icon-svg {
+  width: 24px;
+  height: 24px;
+}
+
+.toast-icon-circle,
+.toast-icon-triangle {
+  stroke-width: 2;
+  stroke-dasharray: 166;
+  stroke-dashoffset: 166;
+  animation: toastStroke 0.6s cubic-bezier(0.65, 0, 0.45, 1) forwards;
+}
+
+.toast-icon-check,
+.toast-icon-x,
+.toast-icon-info-mark,
+.toast-icon-exclaim {
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: 48;
+  stroke-dashoffset: 48;
+  animation: toastStroke 0.3s cubic-bezier(0.65, 0, 0.45, 1) 0.4s forwards;
+}
+
+@keyframes toastStroke {
+  100% {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* Toast Type Colors */
+.toast-success .toast-icon-circle,
+.toast-success .toast-icon-check {
+  stroke: var(--success);
+}
+
+.toast-error .toast-icon-circle,
+.toast-error .toast-icon-x {
+  stroke: var(--danger);
+}
+
+.toast-info .toast-icon-circle,
+.toast-info .toast-icon-info-mark {
+  stroke: var(--primary);
+}
+
+.toast-warning .toast-icon-triangle,
+.toast-warning .toast-icon-exclaim {
+  stroke: var(--warning);
+}
+
+/* Toast Border Accent */
+.toast-success { border-left: 3px solid var(--success); }
+.toast-error { border-left: 3px solid var(--danger); }
+.toast-info { border-left: 3px solid var(--primary); }
+.toast-warning { border-left: 3px solid var(--warning); }
+
+/* ===== Analytics Stat Card ===== */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px;
+}
+
+.stat-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.stat-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.stat-card-icon {
+  font-size: 18px;
+}
+
+.stat-card-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.stat-card-value {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.stat-card-number {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1;
+}
+
+.stat-card-unit {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.stat-card-change {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.stat-card-change-label {
+  color: var(--text-muted);
+  font-weight: 400;
+  margin-left: 4px;
+}
+
+/* ===== Analytics Bar Chart ===== */
+.bar-chart {
+  width: 100%;
+}
+
+.bar-chart-legend {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.bar-chart-body {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  height: 120px;
+  gap: 8px;
+}
+
+.bar-chart-group {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.bar-chart-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 100px;
+  width: 100%;
+  justify-content: center;
+}
+
+.bar-chart-bar {
+  width: 16px;
+  min-height: 4px;
+  border-radius: 4px 4px 0 0;
+  position: relative;
+  transition: height 0.3s ease;
+}
+
+.bar-chart-bar .bar-value {
+  position: absolute;
+  top: -18px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.bar-chart-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* ===== Analytics Line Chart ===== */
+.line-chart {
+  width: 100%;
+}
+
+.line-chart-body {
+  display: flex;
+  justify-content: space-between;
+  height: 120px;
+  gap: 8px;
+}
+
+.line-chart-point-wrapper {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+  height: 100px;
+}
+
+.line-chart-point {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  transform: translateX(-50%);
+  left: 50%;
+}
+
+.line-chart-value {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.line-chart-label {
+  position: absolute;
+  bottom: -20px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* ===== Table ===== */
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.table th,
+.table td {
+  padding: 12px 16px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.table th {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+}
+
+.table td {
+  font-size: 14px;
+}
+
+.table tbody tr:hover {
+  background: var(--bg-secondary);
+}
+
+/* ===== Sortable Table Header ===== */
+.table th.sortable-header {
+  cursor: pointer !important;
+  user-select: none;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.table th.sortable-header:hover {
+  background: var(--bg);
+  color: var(--primary);
+}
+
+/* ===== Calendar ===== */
+.calendar-grid {
+  width: 100%;
+}
+
+.calendar-header {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.calendar-weekday {
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 8px 0;
+  color: var(--text-secondary);
+}
+
+.calendar-body {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+}
+
+.calendar-cell {
+  aspect-ratio: 1;
+  min-height: 80px;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.calendar-cell:hover {
+  transform: scale(1.02);
+  box-shadow: var(--shadow-md);
+  z-index: 1;
+}
+
+.calendar-cell-empty {
+  background: transparent;
+  cursor: default;
+}
+
+.calendar-cell-empty:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.calendar-cell-today {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+.calendar-day-number {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.calendar-guest-name {
+  font-size: 10px;
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.9;
+}
+
+.calendar-legend {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.calendar-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.calendar-legend-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+}
+
+/* ===== Logo Image Styles ===== */
+.sidebar-logo-img {
+  height: 36px;
+  width: auto;
+  max-width: 180px;
+  object-fit: contain;
+}
+
+.mobile-logo-img {
+  height: 32px;
+  width: auto;
+  object-fit: contain;
+}
+
+/* ===== Notification Dropdown Mobile ===== */
+@media (max-width: 768px) {
+  .notification-dropdown {
+    left: auto !important;
+    right: 0 !important;
+    max-width: calc(100vw - 32px) !important;
+  }
+}
+
+/* ===== Mobile Responsive ===== */
+
+/* Mobile Header - 데스크톱에서는 숨김 */
+.mobile-header {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 56px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 0 16px;
+  align-items: center;
+  justify-content: space-between;
+  z-index: 100;
+}
+
+.mobile-header-logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--text);
+}
+
+.mobile-header-logo .sidebar-logo-icon {
+  width: 32px;
+  height: 32px;
+  font-size: 14px;
+}
+
+.mobile-menu-btn {
+  background: none;
+  border: none;
+  padding: 8px;
+  color: var(--text);
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+
+.mobile-menu-btn:hover {
+  background: var(--bg);
+}
+
+/* Mobile Overlay */
+.mobile-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 199;
+  backdrop-filter: blur(4px);
+}
+
+/* Mobile Close Button */
+.mobile-close-btn {
+  background: none;
+  border: none;
+  padding: 8px;
+  color: var(--text-sidebar);
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+
+.mobile-close-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* Mobile Bottom Navigation */
+.mobile-bottom-nav {
+  display: none;
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 64px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  padding: 0 8px;
+  padding-bottom: env(safe-area-inset-bottom, 0);
+  z-index: 100;
+}
+
+.mobile-nav-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px 4px;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 10px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.mobile-nav-item.active {
+  color: var(--primary);
+}
+
+.mobile-nav-icon {
+  font-size: 20px;
+}
+
+.mobile-nav-label {
+  font-weight: 500;
+}
+
+/* Desktop/Mobile visibility helpers */
+.desktop-only {
+  display: block;
+}
+
+.mobile-only {
+  display: none;
+}
+
+/* ===== Mobile Breakpoint (768px) ===== */
+@media (max-width: 768px) {
+  /* Show mobile elements */
+  .mobile-header {
+    display: flex;
+  }
+  
+  .mobile-overlay {
+    display: block;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+  }
+  
+  .sidebar.open + .main-content .mobile-overlay,
+  .sidebar.open ~ .mobile-overlay {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  
+  .mobile-bottom-nav {
+    display: flex;
+  }
+  
+  .desktop-only {
+    display: none !important;
+  }
+  
+  .mobile-only {
+    display: block !important;
+  }
+  
+  /* Sidebar - 모바일에서는 숨기고 슬라이드 메뉴로 */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 280px;
+    z-index: 200;
+    transform: translateX(-100%);
+    transition: transform 0.3s ease;
+  }
+  
+  .sidebar.open {
+    transform: translateX(0);
+  }
+  
+  /* Main content 조정 */
+  .main-content {
+    padding-top: 56px; /* 모바일 헤더 높이 */
+    padding-bottom: 64px; /* 하단 네비게이션 높이 */
+    overflow-y: auto !important;
+    height: 100vh;
+  }
+  
+  /* App layout */
+  .app-layout {
+    flex-direction: column;
+  }
+  
+  /* Page header 모바일 */
+  .page-header {
+    padding: 16px;
+  }
+  
+  .page-header-content {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  
+  .page-title {
+    font-size: 18px;
+  }
+  
+  /* Calendar 모바일 */
+  .calendar-cell {
+    min-height: 60px;
+    padding: 4px;
+  }
+  
+  .calendar-day-number {
+    font-size: 12px;
+  }
+  
+  .calendar-guest-name {
+    font-size: 8px;
+  }
+  
+  .calendar-weekday {
+    font-size: 10px;
+    padding: 6px 0;
+  }
+  
+  .calendar-legend {
+    gap: 8px;
+    font-size: 10px;
+  }
+  
+  .calendar-legend-dot {
+    width: 10px;
+    height: 10px;
+  }
+  
+  /* 달력 컨테이너 오버플로우 방지 */
+  .calendar-grid {
+    width: 100% !important;
+    max-width: 100% !important;
+    overflow-x: hidden;
+  }
+  
+  .calendar-header,
+  .calendar-body {
+    width: 100% !important;
+  }
+  
+  /* 달력 페이지 전체 */
+  .main-content {
+    overflow-x: hidden;
+  }
+  
+  /* 달력 페이지 패딩 조정 */
+  .main-content > div[style*="padding: 24px 32px"] {
+    padding: 0 !important;
+  }
+  
+  /* ===== 달력 페이지 헤더 ===== */
+  .calendar-page-header {
+    padding: 12px 16px !important;
+    margin-bottom: 0 !important;
+    background: var(--surface) !important;
+  }
+  
+  .calendar-page-header .page-header-content {
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    gap: 8px !important;
+  }
+  
+  .calendar-page-header .page-title {
+    font-size: 16px !important;
+    margin-bottom: 0 !important;
+  }
+  
+  .calendar-page-header .page-subtitle {
+    display: none !important;
+  }
+  
+  /* 숙소 선택 + 동기화 버튼 */
+  .calendar-page-header .select {
+    min-width: 100px !important;
+    max-width: 140px !important;
+    font-size: 11px !important;
+    padding: 6px 8px !important;
+  }
+  
+  .calendar-page-header .btn {
+    padding: 6px 10px !important;
+    font-size: 11px !important;
+  }
+  
+  /* ===== 달력 stat 카드 - 작게 1줄 4개 ===== */
+  .calendar-stats {
+    display: grid !important;
+    grid-template-columns: repeat(4, 1fr) !important;
+    gap: 6px !important;
+    padding: 8px 16px !important;
+  }
+  
+  .calendar-stats .stat-card {
+    min-width: unset !important;
+    padding: 8px 6px !important;
+    min-height: unset !important;
+  }
+  
+  .calendar-stats .stat-card-header {
+    margin-bottom: 4px !important;
+    gap: 4px !important;
+  }
+  
+  .calendar-stats .stat-card-icon {
+    font-size: 12px !important;
+  }
+  
+  .calendar-stats .stat-card-label {
+    font-size: 9px !important;
+    white-space: nowrap;
+  }
+  
+  .calendar-stats .stat-card-number {
+    font-size: 16px !important;
+  }
+  
+  .calendar-stats .stat-card-unit {
+    font-size: 10px !important;
+  }
+  
+  /* ===== 달력 네비게이션 - 깔끔하게 ===== */
+  .calendar-nav {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    padding: 12px 16px !important;
+    gap: 8px !important;
+    background: var(--surface);
+    border-radius: var(--radius);
+    margin: 8px 16px !important;
+  }
+  
+  .calendar-nav-month {
+    font-size: 16px !important;
+    font-weight: 600 !important;
+    white-space: nowrap !important;
+    text-align: center;
+    flex: 1;
+  }
+  
+  .calendar-nav-buttons {
+    display: flex !important;
+    gap: 4px !important;
+  }
+  
+  .calendar-nav button,
+  .calendar-nav-buttons button {
+    padding: 6px 12px !important;
+    font-size: 12px !important;
+    border-radius: 6px !important;
+    min-width: unset !important;
+  }
+  
+  .calendar-nav-prev,
+  .calendar-nav-next {
+    width: 32px !important;
+    height: 32px !important;
+    padding: 0 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+  }
+  
+  .calendar-nav-today {
+    padding: 6px 10px !important;
+    font-size: 11px !important;
+  }
+  
+  /* ===== 달력 레전드 ===== */
+  .calendar-legend {
+    padding: 8px 16px !important;
+    gap: 8px !important;
+    font-size: 10px !important;
+    flex-wrap: wrap;
+  }
+  
+  .calendar-legend-item {
+    gap: 4px !important;
+  }
+  
+  .calendar-legend-dot {
+    width: 8px !important;
+    height: 8px !important;
+  }
+  
+  /* ===== 달력 그리드 ===== */
+  .calendar-grid {
+    padding: 0 16px 100px !important;
+  }
+  
+  .calendar-weekday {
+    font-size: 10px !important;
+    padding: 4px 0 !important;
+  }
+  
+  /* 달력 셀 */
+  .calendar-cell {
+    min-height: 44px !important;
+    aspect-ratio: unset !important;
+    padding: 2px !important;
+  }
+  
+  .calendar-day-number {
+    font-size: 11px !important;
+  }
+  
+  .calendar-guest-name {
+    font-size: 7px !important;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  
+  /* Stats grid 모바일 */
+  .stat-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+  }
+  
+  .stat-card {
+    padding: 16px;
+  }
+  
+  .stat-card-number {
+    font-size: 22px;
+  }
+}
+
+/* ===== Inbox Mobile Styles ===== */
+
+/* 모바일 뒤로가기 버튼 - 기본 숨김 */
+.mobile-chat-back-btn {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  /* 모바일 뒤로가기 버튼 */
+  .mobile-chat-back-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    top: 8px;
+    left: 8px;
+    width: 36px;
+    height: 36px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    color: var(--text);
+    font-size: 18px;
+    cursor: pointer;
+    z-index: 200;
+    box-shadow: var(--shadow);
+  }
+  
+  .mobile-chat-back-btn:active {
+    background: var(--bg);
+    transform: scale(0.95);
+  }
+
+  /* Inbox top header */
+  .inbox-top-header {
+    display: none; /* 모바일 헤더로 대체 */
+  }
+  
+  /* Inbox filter row */
+  .inbox-filter-row {
+    padding: 8px 12px;
+    gap: 8px;
+  }
+  
+  .inbox-stats-inline {
+    display: none; /* 모바일에서 간소화 */
+  }
+  
+  .inbox-filter-tabs {
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  
+  .inbox-filter-tab {
+    padding: 6px 10px;
+    font-size: 11px;
+  }
+  
+  /* Inbox 3-column layout → 1-column */
+  .inbox-container {
+    flex-direction: column;
+    position: relative;
+  }
+  
+  .inbox-list-panel {
+    width: 100%;
+    height: 100%;
+    border-right: none;
+  }
+  
+  .inbox-chat-panel {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 150;
+    display: none;
+    background: var(--bg);
+  }
+  
+  .inbox-container.chat-open .inbox-list-panel {
+    display: none;
+  }
+  
+  .inbox-container.chat-open .inbox-chat-panel {
+    display: flex;
+    flex-direction: column;
+  }
+  
+  .inbox-info-panel {
+    display: none;
+  }
+  
+  /* Inbox list header */
+  .inbox-list-header {
+    padding: 12px 16px;
+  }
+  
+  .inbox-list-title {
+    font-size: 16px;
+    margin-bottom: 10px;
+  }
+  
+  /* Inbox search */
+  .inbox-search-input {
+    padding: 10px 12px 10px 36px;
+    font-size: 14px;
+  }
+  
+  /* Conversation items */
+  .inbox-conversation-item {
+    padding: 12px 16px;
+  }
+  
+  .inbox-avatar {
+    width: 40px;
+    height: 40px;
+    font-size: 14px;
+  }
+  
+  .inbox-conversation-name {
+    font-size: 13px;
+  }
+  
+  .inbox-conversation-property {
+    font-size: 10px;
+    padding: 2px 6px;
+  }
+  
+  .inbox-conversation-dates {
+    font-size: 11px;
+  }
+  
+  /* ===== 모바일 채팅 헤더 - 메신저 스타일 ===== */
+  .inbox-chat-panel .card-header {
+    padding: 8px 12px !important;
+    padding-left: 50px !important; /* 뒤로가기 버튼 공간 */
+    min-height: 50px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: relative;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  
+  /* 게스트 정보 컴팩트하게 */
+  .inbox-chat-panel .card-header .conversation-avatar {
+    width: 28px !important;
+    height: 28px !important;
+    font-size: 11px !important;
+  }
+  
+  .inbox-chat-panel .card-header > div:first-child > div:last-child {
+    gap: 4px !important;
+  }
+  
+  .inbox-chat-panel .card-header > div:first-child > div:last-child > div:first-child {
+    font-size: 13px !important;
+  }
+  
+  .inbox-chat-panel .card-header > div:first-child > div:last-child > div:first-child span {
+    font-size: 13px !important;
+  }
+  
+  /* 날짜/상태 뱃지 작게 */
+  .inbox-chat-panel .card-header .badge {
+    padding: 2px 6px !important;
+    font-size: 9px !important;
+  }
+  
+  /* 헤더 우측 액션들 - 작게 유지 */
+  .inbox-chat-panel .card-header > div:last-child {
+    gap: 4px !important;
+    flex-wrap: wrap;
+  }
+  
+  .inbox-chat-panel .card-header > div:last-child .btn {
+    padding: 4px 8px !important;
+    font-size: 10px !important;
+  }
+  
+  /* Airbnb 링크 텍스트 숨기고 아이콘만 */
+  .inbox-chat-panel .card-header > div:last-child a.btn span,
+  .inbox-chat-panel .card-header > div:last-child a.btn svg + span {
+    display: none;
+  }
+  
+  /* ===== 메시지 영역 - 시원하게 ===== */
+  .inbox-chat-panel .message-list {
+    flex: 1;
+    padding: 12px;
+    padding-bottom: 140px; /* 컴포저 높이만큼 */
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  
+  .inbox-chat-panel .message {
+    margin-bottom: 8px;
+  }
+  
+  .inbox-chat-panel .message-bubble {
+    max-width: 85%;
+    padding: 10px 14px;
+    font-size: 14px;
+    line-height: 1.5;
+    border-radius: 16px;
+  }
+  
+  .inbox-chat-panel .message.incoming .message-bubble {
+    border-bottom-left-radius: 4px;
+  }
+  
+  .inbox-chat-panel .message.outgoing .message-bubble {
+    border-bottom-right-radius: 4px;
+  }
+  
+  .inbox-chat-panel .message-time {
+    font-size: 10px;
+    margin-top: 4px;
+  }
+  
+  /* ===== 컴포저 - 하단 고정 ===== */
+  .inbox-chat-panel .composer {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: 8px 12px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    z-index: 160;
+  }
+  
+  /* Risk Signals, Outcome Label 숨김 (복잡한 정보) */
+  .inbox-chat-panel .composer > div:has(.risk-signal),
+  .inbox-chat-panel .composer > div:has(.outcome-label) {
+    display: none !important;
+  }
+  
+  /* 액션 버튼들 + 발송 버튼을 한 줄에 */
+  .inbox-chat-panel .composer-actions {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+    align-items: center;
+  }
+  
+  .inbox-chat-panel .composer-actions .btn {
+    flex-shrink: 0;
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+  
+  /* Composer input: textarea + 발송 버튼 가로 배치 */
+  .inbox-chat-panel .composer-input {
+    display: flex;
+    flex-direction: row;
+    gap: 8px;
+    align-items: flex-end;
+  }
+  
+  .inbox-chat-panel .composer-textarea {
+    flex: 1;
+    min-height: 44px !important;
+    max-height: 100px !important;
+    padding: 10px 12px;
+    font-size: 15px;
+    border-radius: 12px;
+    resize: none;
+  }
+  
+  .inbox-chat-panel .composer-input .composer-send {
+    flex-shrink: 0;
+    padding: 10px 14px;
+    font-size: 13px;
+    border-radius: 10px;
+    min-height: 44px;
+    white-space: nowrap;
+  }
+}
+
+/* ===== Small Mobile (480px) ===== */
+@media (max-width: 480px) {
+  .mobile-header {
+    padding: 0 12px;
+  }
+  
+  .mobile-bottom-nav {
+    padding: 0 4px;
+  }
+  
+  .mobile-nav-label {
+    font-size: 9px;
+  }
+  
+  .calendar-cell {
+    min-height: 50px;
+  }
+  
+  .stat-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .inbox-filter-tabs {
+    gap: 2px;
+    padding: 2px;
+  }
+  
+  .inbox-filter-tab {
+    padding: 6px 10px;
+    font-size: 11px;
+  }
+}
+
+/* ===== Dashboard Mobile Styles ===== */
+@media (max-width: 768px) {
+  /* Dashboard Header - 컴팩트하게 */
+  .dashboard-header {
+    padding: 12px 16px !important;
+    margin-top: 0 !important;
+  }
+  
+  .dashboard-header .page-header-content {
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+  }
+  
+  .dashboard-header .page-title {
+    font-size: 18px !important;
+    margin-bottom: 0 !important;
+  }
+  
+  .dashboard-header .page-subtitle {
+    display: none; /* 모바일에서 서브타이틀 숨김 */
+  }
+  
+  .dashboard-refresh-btn {
+    width: 36px !important;
+    height: 36px !important;
+    padding: 0 !important;
+    font-size: 16px !important;
+    border-radius: 50% !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+  }
+  
+  /* Dashboard Summary Cards - 3개 균등 배치 */
+  .dashboard-summary-cards {
+    display: grid !important;
+    grid-template-columns: repeat(3, 1fr) !important;
+    gap: 8px !important;
+    padding: 8px 16px 12px !important;
+    margin-top: 0 !important;
+    overflow: visible !important;
+  }
+  
+  .dashboard-summary-cards > div {
+    min-width: unset !important;
+    padding: 10px 6px !important;
+    border-radius: 8px !important;
+  }
+  
+  .dashboard-summary-cards > div:nth-child(n+4) {
+    display: none !important; /* 4번째부터 숨김 */
+  }
+  
+  /* Summary Card 내부 - 세로 중앙 정렬 */
+  .dashboard-summary-cards > div > div {
+    flex-direction: column !important;
+    align-items: center !important;
+    text-align: center;
+    gap: 4px !important;
+  }
+  
+  /* 아이콘 */
+  .dashboard-summary-cards > div > div > span:first-child {
+    font-size: 16px !important;
+  }
+  
+  /* 텍스트 컨테이너 */
+  .dashboard-summary-cards > div > div > div {
+    text-align: center;
+  }
+  
+  /* 라벨 */
+  .dashboard-summary-cards > div > div > div > div:first-child {
+    font-size: 9px !important;
+    margin-bottom: 2px !important;
+    white-space: nowrap;
+  }
+  
+  /* 숫자 */
+  .dashboard-summary-cards > div > div > div > div:last-child {
+    font-size: 18px !important;
+  }
+  
+  /* Dashboard Main Content */
+  .dashboard-main-content {
+    padding: 16px 16px 100px !important; /* 상단 패딩 추가 */
+    gap: 16px !important;
+    overflow-y: visible !important;
+    flex: unset !important;
+  }
+  
+  /* 50:50 Grid → 1 Column */
+  .dashboard-grid-2col {
+    grid-template-columns: 1fr !important;
+  }
+  
+  /* Card 높이 조정 */
+  .dashboard-card {
+    min-height: 180px !important;
+  }
+  
+  /* Conversation Item 모바일 */
+  .conversation-item {
+    padding: 12px 16px;
+  }
+  
+  .conversation-avatar {
+    width: 36px;
+    height: 36px;
+    font-size: 14px;
+  }
+  
+  .conversation-name {
+    font-size: 13px;
+  }
+  
+  .conversation-preview {
+    font-size: 12px;
+  }
+  
+  /* Empty State 모바일 */
+  .empty-state {
+    padding: 24px 16px;
+  }
+  
+  .empty-state-icon {
+    font-size: 32px;
+    margin-bottom: 8px;
+  }
+  
+  .empty-state-title {
+    font-size: 14px;
+  }
+}
+
+/* 더 작은 화면 */
+@media (max-width: 360px) {
+  .dashboard-summary-cards > div {
+    padding: 8px 4px !important;
+  }
+  
+  .dashboard-summary-cards > div > div > span:first-child {
+    font-size: 14px !important;
+  }
+  
+  .dashboard-summary-cards > div > div > div > div:first-child {
+    font-size: 8px !important;
+  }
+  
+  .dashboard-summary-cards > div > div > div > div:last-child {
+    font-size: 16px !important;
+  }
+}
+
+/* ===== Reservations Page Mobile Styles ===== */
+@media (max-width: 768px) {
+  /* 예약 관리 페이지 헤더 */
+  .reservations-page .inbox-top-header {
+    padding: 12px 16px !important;
+    gap: 8px;
+  }
+  
+  .reservations-page .inbox-page-title {
+    font-size: 18px !important;
+  }
+  
+  .reservations-page .inbox-top-header-right {
+    gap: 6px !important;
+  }
+  
+  .reservations-page .inbox-top-header .inbox-btn {
+    padding: 6px 10px !important;
+    font-size: 11px !important;
+  }
+  
+  /* 필터 Row - 모바일 최적화 */
+  .reservations-page .inbox-filter-row {
+    padding: 8px 12px !important;
+    gap: 6px !important;
+    flex-wrap: wrap;
+  }
+  
+  /* 검색 박스 - 전체 너비 */
+  .reservations-page .inbox-search {
+    width: 100% !important;
+    order: -1;
+    margin-bottom: 4px !important;
+  }
+  
+  .reservations-page .inbox-search-input {
+    padding: 10px 12px 10px 36px !important;
+    font-size: 14px !important;
+  }
+  
+  /* 필터 셀렉트들 - 2열 배치 */
+  .reservations-page .inbox-filter-select {
+    flex: 1 1 calc(50% - 4px);
+    min-width: 0 !important;
+    max-width: calc(50% - 4px);
+    padding: 8px 6px !important;
+    font-size: 11px !important;
+  }
+  
+  /* 미배정만 체크박스 */
+  .reservations-page label[style*="display: flex"] {
+    font-size: 11px !important;
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+  
+  /* 날짜 필터 - 전체 너비 */
+  .reservations-page .inbox-filter-row > div[style*="margin-left: auto"] {
+    width: 100%;
+    margin-left: 0 !important;
+    margin-top: 4px;
+    display: flex !important;
+    align-items: center;
+    gap: 6px !important;
+  }
+  
+  .reservations-page .inbox-filter-row > div[style*="margin-left: auto"] span {
+    font-size: 11px !important;
+  }
+  
+  .reservations-page .inbox-filter-row input[type="date"] {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 6px !important;
+    font-size: 11px !important;
+  }
+  
+  /* 콘텐츠 영역 패딩 */
+  .reservations-page > div[style*="padding: 20px 24px"] {
+    padding: 12px 16px 100px !important;
+  }
+  
+  /* 테이블 컨테이너 */
+  .reservations-page > div > div[style*="background: var(--surface)"] {
+    border: none !important;
+    background: transparent !important;
+  }
+  
+  /* 테이블 → 카드 변환 */
+  .reservations-page table {
+    display: block !important;
+    width: 100% !important;
+  }
+  
+  .reservations-page thead {
+    display: none !important;
+  }
+  
+  .reservations-page tbody {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 10px !important;
+  }
+  
+  /* 예약 카드 */
+  .reservations-page tbody tr {
+    display: grid !important;
+    grid-template-columns: 1fr auto;
+    grid-template-rows: auto auto auto;
+    gap: 6px 12px;
+    padding: 14px !important;
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-lg) !important;
+    align-items: start;
+  }
+  
+  .reservations-page tbody tr:hover {
+    background: var(--surface) !important;
+  }
+  
+  .reservations-page tbody td {
+    padding: 0 !important;
+    border: none !important;
+    background: transparent !important;
+  }
+  
+  /* 1행: 게스트명 + 인원수 */
+  .reservations-page tbody td:nth-child(1) {
+    grid-column: 1;
+    grid-row: 1;
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+  }
+  
+  .reservations-page tbody td:nth-child(1) > div:first-child {
+    font-size: 15px !important;
+    font-weight: 600 !important;
+  }
+  
+  .reservations-page tbody td:nth-child(1) > div:last-child {
+    font-size: 12px !important;
+    color: var(--text-secondary);
+    margin-top: 0 !important;
+  }
+  
+  /* 1행 우측: 상태 뱃지 */
+  .reservations-page tbody td:nth-child(5) {
+    grid-column: 2;
+    grid-row: 1;
+    text-align: right !important;
+  }
+  
+  .reservations-page tbody td:nth-child(5) .inbox-status-badge {
+    font-size: 10px !important;
+    padding: 3px 8px !important;
+  }
+  
+  /* 2행: 예약코드 + 일정 */
+  .reservations-page tbody td:nth-child(2) {
+    grid-column: 1;
+    grid-row: 2;
+    display: inline-flex !important;
+    align-items: center;
+    gap: 8px;
+  }
+  
+  .reservations-page tbody td:nth-child(2) code {
+    font-size: 10px !important;
+    padding: 2px 6px !important;
+  }
+  
+  .reservations-page tbody td:nth-child(3) {
+    grid-column: 1;
+    grid-row: 2;
+    margin-left: auto;
+    font-size: 12px !important;
+    color: var(--text-secondary);
+  }
+  
+  /* 2행 우측: 배정 상태 */
+  .reservations-page tbody td:nth-child(6) {
+    grid-column: 2;
+    grid-row: 2;
+    text-align: right !important;
+  }
+  
+  .reservations-page tbody td:nth-child(6) .inbox-status-badge {
+    font-size: 9px !important;
+    padding: 2px 6px !important;
+  }
+  
+  /* 3행: 숙소 정보 */
+  .reservations-page tbody td:nth-child(4) {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    font-size: 12px !important;
+    color: var(--text-secondary);
+    padding-top: 6px !important;
+    border-top: 1px solid var(--border-light) !important;
+    margin-top: 4px;
+    display: flex !important;
+    align-items: center;
+    justify-content: space-between;
+  }
+  
+  .reservations-page tbody td:nth-child(4) > div:first-child {
+    font-size: 12px !important;
+  }
+  
+  .reservations-page tbody td:nth-child(4) > div:last-child {
+    font-size: 10px !important;
+    color: var(--text-muted);
+    max-width: 50%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: none; /* 리스팅명 숨김 */
+  }
+  
+  /* 액션 버튼들 - 숙소 옆에 배치 */
+  .reservations-page tbody td:nth-child(7) {
+    grid-column: 2;
+    grid-row: 3;
+    padding-top: 6px !important;
+    margin-top: 4px;
+  }
+  
+  .reservations-page tbody td:nth-child(7) > div {
+    gap: 4px !important;
+  }
+  
+  .reservations-page tbody td:nth-child(7) .inbox-btn {
+    padding: 6px 8px !important;
+    font-size: 14px !important;
+  }
+  
+  /* 페이지네이션 */
+  .reservations-page > div > div[style*="display: flex"][style*="margin-top: 20px"] {
+    flex-wrap: wrap;
+    gap: 6px !important;
+    justify-content: center;
+    margin-top: 16px !important;
+  }
+  
+  .reservations-page > div > div[style*="margin-top: 20px"] .inbox-btn {
+    padding: 8px 12px !important;
+    font-size: 12px !important;
+  }
+}
+
+/* ===== Staff Alerts Page Mobile Styles ===== */
+@media (max-width: 768px) {
+  /* Staff Alerts 페이지 전체 컨테이너 */
+  .staff-alerts-page {
+    padding-bottom: 80px;
+  }
+  
+  /* 페이지 헤더 - 다른 페이지와 동일하게 */
+  .staff-alerts-page .page-header {
+    padding: 12px 16px !important;
+  }
+  
+  .staff-alerts-page .page-header-content {
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    gap: 8px !important;
+  }
+  
+  .staff-alerts-page .page-title {
+    font-size: 18px !important;
+    margin-bottom: 0 !important;
+  }
+  
+  .staff-alerts-page .page-subtitle {
+    display: none !important;
+  }
+  
+  .staff-alerts-page .page-header-content > div:last-child {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  
+  .staff-alerts-page .page-header-content > div:last-child > span {
+    font-size: 10px !important;
+  }
+  
+  .staff-alerts-page .page-header .btn {
+    padding: 8px 12px !important;
+    font-size: 11px !important;
+  }
+  
+  /* Stats 카드 - 대시보드처럼 컴팩트하게 */
+  .staff-alerts-page > div[style*="padding: 16px 32px"] {
+    display: grid !important;
+    grid-template-columns: repeat(3, 1fr) !important;
+    padding: 8px 16px !important;
+    gap: 8px !important;
+  }
+  
+  .staff-alerts-page .stat-card {
+    flex: unset !important;
+    padding: 10px 8px !important;
+    text-align: center;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 4px !important;
+  }
+  
+  .staff-alerts-page .stat-label {
+    font-size: 10px !important;
+    margin-bottom: 0 !important;
+  }
+  
+  .staff-alerts-page .stat-value {
+    font-size: 18px !important;
+  }
+  
+  /* 콘텐츠 영역 */
+  .staff-alerts-page > div[style*="padding: 0 32px 32px"] {
+    padding: 12px 16px 100px !important;
+  }
+  
+  /* 섹션 타이틀 */
+  .staff-alerts-page h2 {
+    font-size: 13px !important;
+    margin-bottom: 10px !important;
+  }
+  
+  /* 알림 카드 */
+  .staff-alerts-page .card {
+    padding: 14px !important;
+    margin-bottom: 10px !important;
+  }
+  
+  /* 카드 헤더 (Priority + Topic) */
+  .staff-alerts-page .card > div:first-child {
+    flex-wrap: wrap;
+    gap: 6px !important;
+  }
+  
+  .staff-alerts-page .card .badge {
+    font-size: 10px !important;
+    padding: 3px 8px !important;
+  }
+  
+  /* 카드 제목 */
+  .staff-alerts-page .card h3 {
+    font-size: 14px !important;
+    margin: 10px 0 6px !important;
+    line-height: 1.4;
+  }
+  
+  /* 카드 내용 (AI 메모) */
+  .staff-alerts-page .card > div[style*="font-style: italic"] {
+    font-size: 12px !important;
+    padding: 8px 10px !important;
+    margin-bottom: 8px !important;
+  }
+  
+  /* 메타 정보 (게스트, 체크인 등) */
+  .staff-alerts-page .card > div[style*="font-size: 12px"] {
+    font-size: 11px !important;
+    flex-wrap: wrap;
+    gap: 6px 12px !important;
+  }
+  
+  /* 카드 푸터 (날짜 + 버튼) */
+  .staff-alerts-page .card > div:last-child {
+    flex-direction: column !important;
+    gap: 10px !important;
+    align-items: stretch !important;
+    margin-top: 10px !important;
+    padding-top: 10px !important;
+  }
+  
+  .staff-alerts-page .card > div:last-child > div:first-child {
+    font-size: 10px !important;
+  }
+  
+  /* 버튼 그룹 */
+  .staff-alerts-page .card > div:last-child > div:last-child {
+    display: flex;
+    gap: 8px !important;
+    justify-content: flex-end;
+  }
+  
+  .staff-alerts-page .card .btn {
+    padding: 8px 12px !important;
+    font-size: 12px !important;
+    flex: 1;
+    max-width: 120px;
+  }
+  
+  /* Airbnb 링크 */
+  .staff-alerts-page .card a[href*="airbnb"] {
+    font-size: 11px !important;
+    padding: 4px 8px !important;
+  }
+}
+
+/* ===== Booking Requests Page Mobile Styles ===== */
+@media (max-width: 768px) {
+  /* 페이지 헤더 */
+  .booking-requests-header {
+    padding: 12px 16px !important;
+  }
+  
+  .booking-requests-header .page-header-content {
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+  }
+  
+  .booking-requests-header .page-title {
+    font-size: 18px !important;
+    margin-bottom: 0 !important;
+  }
+  
+  .booking-requests-header .page-subtitle {
+    display: none !important;
+  }
+  
+  .booking-requests-header .btn {
+    padding: 8px 12px !important;
+    font-size: 11px !important;
+  }
+  
+  .booking-requests-header .urgent-badge {
+    padding: 4px 8px !important;
+    font-size: 10px !important;
+  }
+  
+  /* 필터 영역 */
+  .booking-requests-filters {
+    padding: 8px 16px 12px !important;
+    gap: 8px !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+  
+  .booking-requests-page .tabs {
+    width: 100%;
+    display: flex;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  
+  .booking-requests-page .tab {
+    flex: 1;
+    padding: 8px 12px !important;
+    font-size: 12px !important;
+    white-space: nowrap;
+    justify-content: center;
+  }
+  
+  .booking-requests-page .tab .badge {
+    font-size: 10px !important;
+    padding: 2px 6px !important;
+    margin-left: 4px !important;
+  }
+  
+  .booking-requests-filters > div:last-child {
+    width: 100%;
+  }
+  
+  .booking-requests-page .input {
+    width: 100% !important;
+    padding: 10px 12px !important;
+    font-size: 14px !important;
+  }
+  
+  /* 메인 레이아웃 */
+  .booking-requests-page .inbox-layout {
+    flex-direction: column;
+    position: relative;
+  }
+  
+  .booking-requests-page .inbox-list {
+    width: 100% !important;
+    height: 100%;
+    border-right: none !important;
+  }
+  
+  .booking-requests-page .inbox-detail {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 150;
+    display: none;
+    background: var(--bg);
+    border-radius: 0 !important;
+  }
+  
+  .booking-requests-page.detail-open .inbox-list {
+    display: none;
+  }
+  
+  .booking-requests-page.detail-open .inbox-detail {
+    display: flex;
+    flex-direction: column;
+  }
+  
+  /* 모바일 뒤로가기 버튼 */
+  .mobile-detail-back-btn {
+    display: none;
+  }
+  
+  .booking-requests-page .mobile-detail-back-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    top: 8px;
+    left: 8px;
+    width: 36px;
+    height: 36px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    color: var(--text);
+    font-size: 18px;
+    cursor: pointer;
+    z-index: 200;
+    box-shadow: var(--shadow);
+  }
+  
+  /* 카드 헤더 */
+  .booking-requests-page .card-header {
+    padding: 12px 16px !important;
+  }
+  
+  .booking-requests-page .card-title {
+    font-size: 14px !important;
+  }
+  
+  /* 리스트 아이템 */
+  .booking-requests-page .conversation-item {
+    padding: 12px 16px !important;
+  }
+  
+  .booking-requests-page .conversation-avatar {
+    width: 36px !important;
+    height: 36px !important;
+    font-size: 14px !important;
+  }
+  
+  .booking-requests-page .conversation-name {
+    font-size: 14px !important;
+  }
+  
+  .booking-requests-page .conversation-preview {
+    font-size: 12px !important;
+  }
+  
+  .booking-requests-page .conversation-meta {
+    gap: 6px !important;
+  }
+  
+  .booking-requests-page .conversation-meta .badge {
+    font-size: 10px !important;
+    padding: 2px 6px !important;
+  }
+  
+  /* 디테일 패널 */
+  .booking-requests-page .inbox-detail > div {
+    padding-top: 50px !important; /* 뒤로가기 버튼 공간 */
+  }
+  
+  .booking-requests-page .inbox-detail h2 {
+    font-size: 18px !important;
+  }
+  
+  .booking-requests-page .inbox-detail h3 {
+    font-size: 13px !important;
+  }
 }

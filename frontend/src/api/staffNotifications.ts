@@ -17,12 +17,14 @@ export type OCStatus = "pending" | "done" | "resolved" | "suggested_resolve";
 export interface StaffNotificationDTO {
   oc_id: string;
   conversation_id: string;
-  thread_id: string;
+  airbnb_thread_id: string;  // 백엔드 필드명에 맞춤
   topic: string;
   description: string;
   evidence_quote: string;
   priority: OCPriority;
   guest_name: string | null;
+  property_code: string | null;
+  property_name: string | null;
   checkin_date: string | null;
   checkout_date: string | null;
   status: OCStatus;
@@ -56,7 +58,7 @@ export interface OCDTO {
 }
 
 export interface OCListResponse {
-  thread_id: string;
+  airbnb_thread_id: string;  // 백엔드 필드명에 맞춤
   items: OCDTO[];
   total: number;
 }
@@ -183,4 +185,19 @@ export async function confirmOCCandidate(ocId: string): Promise<OCActionResponse
  */
 export async function rejectOCCandidate(ocId: string): Promise<OCActionResponse> {
   return apiPost<OCActionResponse>(`/staff-notifications/${ocId}/reject-candidate`, {});
+}
+
+/**
+ * 우선순위 변경
+ * POST /api/v1/staff-notifications/{oc_id}/change-priority
+ * 
+ * - immediate: target_date = today
+ * - upcoming: target_date = today + 1
+ * - pending: target_date 유지
+ */
+export async function changeOCPriority(
+  ocId: string, 
+  priority: OCPriority
+): Promise<OCActionResponse> {
+  return apiPost<OCActionResponse>(`/staff-notifications/${ocId}/change-priority`, { priority });
 }

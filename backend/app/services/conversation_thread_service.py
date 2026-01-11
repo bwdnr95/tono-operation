@@ -366,10 +366,14 @@ class SendLogService:
         payload_json: dict | None = None,
     ) -> SendActionLog:
         """발송 액션을 로그에 기록"""
+        # property_code는 reservation_info에서 조회 (Single Source of Truth)
+        from app.services.property_resolver import get_effective_property_code
+        effective_property_code = get_effective_property_code(self.db, conversation.airbnb_thread_id) or ""
+        
         log = SendActionLog(
             conversation_id=conversation.id,
             airbnb_thread_id=conversation.airbnb_thread_id,
-            property_code=conversation.property_code or "",
+            property_code=effective_property_code,  # reservation_info 기반
             message_id=message_id,
             action=action,
             content_sent=content_sent,

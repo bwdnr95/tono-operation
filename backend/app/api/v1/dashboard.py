@@ -208,11 +208,14 @@ def get_unanswered_messages(
     
     items = []
     for c in conversations:
-        # 마지막 메시지 가져오기
+        # 🆕 마지막 "게스트" 메시지 가져오기 (호스트 메시지 제외)
+        # received_at이 같을 경우 id로 추가 정렬
         last_msg = db.query(IncomingMessage).filter(
-            IncomingMessage.airbnb_thread_id == c.airbnb_thread_id
+            IncomingMessage.airbnb_thread_id == c.airbnb_thread_id,
+            IncomingMessage.direction == "incoming",  # 게스트 → 호스트 방향
         ).order_by(
-            IncomingMessage.received_at.desc()
+            IncomingMessage.received_at.desc(),
+            IncomingMessage.id.desc(),  # 🆕 같은 시간일 때 id로 정렬
         ).first()
         
         hours_since = 0
@@ -270,8 +273,10 @@ def get_staff_alerts(
                 Conversation.id == item.conversation_id
             ).first()
             if conv:
-                property_code = conv.property_code
                 airbnb_thread_id = conv.airbnb_thread_id
+                # property_code는 reservation_info에서 조회 (Single Source of Truth)
+                from app.services.property_resolver import get_effective_property_code
+                property_code = get_effective_property_code(db, conv.airbnb_thread_id)
                 # property_name은 property_profiles에서 조회 가능하면 추가
         
         items.append(StaffAlertDTO(

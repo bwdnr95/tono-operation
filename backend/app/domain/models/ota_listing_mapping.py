@@ -51,9 +51,18 @@ class OtaListingMapping(Base):
     )
 
     # TONO 내부 property_code (PropertyProfile.property_code)
-    property_code: Mapped[str] = mapped_column(
+    # 그룹 매핑 시 NULL 가능
+    property_code: Mapped[str | None] = mapped_column(
         String(64),
-        nullable=False,
+        nullable=True,
+        index=True,
+    )
+
+    # 그룹 매핑 시 사용 (property_code가 NULL일 때 필수)
+    # property_code가 있는 경우에도 그룹 소속이면 함께 저장
+    group_code: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
         index=True,
     )
 

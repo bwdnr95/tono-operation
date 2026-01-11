@@ -14,6 +14,8 @@ from app.api.v1 import (
     bulk_send,
     commitments,
     properties,  # 숙소 관리
+    property_groups,  # 🆕 숙소 그룹 관리 (별도 prefix)
+    reservations,  # 🆕 예약 관리 (객실 배정)
     dashboard,  # 대시보드
     analytics,  # 분석
     calendar,  # 달력 (iCal)
@@ -22,6 +24,7 @@ from app.api.v1 import (
     complaints,  # 🆕 Complaint (게스트 불만/문제)
     learning,  # 🆕 Learning Agent (AI 품질 분석)
     orchestrator,  # 🆕 Orchestrator (판단 엔진)
+    events,  # 🆕 SSE 이벤트 스트리밍
 )
 
 api_router = APIRouter()
@@ -40,6 +43,12 @@ api_router.include_router(commitments.router)
 
 # ✅ Property Management (숙소 관리)
 api_router.include_router(properties.router)
+
+# ✅ Property Groups (숙소 그룹) - /property-groups prefix
+api_router.include_router(property_groups.router)
+
+# ✅ Reservation Management (예약 관리, 객실 배정)
+api_router.include_router(reservations.router)
 
 # ✅ Dashboard (대시보드)
 api_router.include_router(dashboard.router)
@@ -63,6 +72,9 @@ api_router.include_router(learning.router)
 
 # ✅ Orchestrator (판단 엔진)
 api_router.include_router(orchestrator.router)
+
+# ✅ SSE Events (실시간 이벤트 스트리밍)
+api_router.include_router(events.router)
 
 # ============================================================
 # Scheduler API (테스트/관리용)

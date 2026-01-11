@@ -1406,9 +1406,10 @@ def _split_message_blocks(text_body: str) -> List[ExtractedMessageBlock]:
     if not text_body:
         return []
     
-    # 메시지 블록 시작 패턴: 이름 + 줄바꿈 + 역할(예약자/게스트/호스트) + 줄바꿈
+    # 메시지 블록 시작 패턴: 이름 + 줄바꿈 + 역할(예약자/게스트/호스트/공동 호스트) + 줄바꿈
     # 역할 라벨 뒤에 오는 내용이 실제 메시지
-    pattern = r'([^\n]+)\n\s*(예약자|게스트|호스트)\s*\n'
+    # 공동 호스트는 "공동 호스트" 또는 "공동호스트" 형태로 올 수 있음
+    pattern = r'([^\n]+)\n\s*(예약자|게스트|공동\s*호스트|호스트)\s*\n'
     
     matches = list(re.finditer(pattern, text_body))
     
@@ -1421,6 +1422,10 @@ def _split_message_blocks(text_body: str) -> List[ExtractedMessageBlock]:
     for i, match in enumerate(matches):
         sender_name = match.group(1).strip()
         sender_role = match.group(2).strip()
+        
+        # 🔹 공동 호스트 → 호스트로 정규화
+        if "공동" in sender_role and "호스트" in sender_role:
+            sender_role = "호스트"
         
         # 🔹 유효한 sender_name인지 검증
         # 예약 정보 섹션의 "게스트" 라벨 등을 필터링

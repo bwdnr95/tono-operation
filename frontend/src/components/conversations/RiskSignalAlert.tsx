@@ -2,10 +2,10 @@
 import type { RiskSignalDTO, RiskSeverity } from "../../types/commitments";
 
 const SEVERITY_STYLES: Record<RiskSeverity, { badgeClass: string; bgColor: string; textColor: string }> = {
-  low: { badgeClass: "badge-default", bgColor: "var(--bg)", textColor: "var(--text-secondary)" },
-  medium: { badgeClass: "badge-warning", bgColor: "rgba(245, 158, 11, 0.1)", textColor: "var(--warning)" },
-  high: { badgeClass: "badge-warning", bgColor: "rgba(245, 158, 11, 0.15)", textColor: "#d97706" },
-  critical: { badgeClass: "badge-danger", bgColor: "rgba(239, 68, 68, 0.1)", textColor: "var(--danger)" },
+  low: { badgeClass: "badge-default", bgColor: "var(--bg-secondary)", textColor: "var(--text-secondary)" },
+  medium: { badgeClass: "badge-warning", bgColor: "var(--warning-bg)", textColor: "var(--warning)" },
+  high: { badgeClass: "badge-warning", bgColor: "var(--warning-bg)", textColor: "var(--warning)" },
+  critical: { badgeClass: "badge-danger", bgColor: "var(--danger-bg)", textColor: "var(--danger)" },
 };
 
 const SEVERITY_LABELS: Record<RiskSeverity, string> = {

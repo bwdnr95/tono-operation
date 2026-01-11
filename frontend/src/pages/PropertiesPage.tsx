@@ -7,6 +7,7 @@
  */
 import { useState, useEffect, useCallback } from "react";
 import { PageLayout } from "../layout/PageLayout";
+import { useToast } from "../components/ui/Toast";
 import {
   getProperties,
   getProperty,
@@ -131,6 +132,41 @@ function BooleanField({ label, value, onChange }: BooleanFieldProps) {
   );
 }
 
+interface SelectFieldProps {
+  label: string;
+  value: string | undefined;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+  helpText?: string;
+}
+
+function SelectField({ label, value, onChange, options, helpText }: SelectFieldProps) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+      <label style={{ fontSize: "13px", fontWeight: "500", color: "var(--text-secondary)" }}>
+        {label}
+      </label>
+      <select
+        className="input"
+        value={value || ""}
+        onChange={(e) => onChange(e.target.value)}
+        style={{ padding: "8px 12px" }}
+      >
+        {options.map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+      {helpText && (
+        <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+          {helpText}
+        </span>
+      )}
+    </div>
+  );
+}
+
 // Property Form Component
 
 interface PropertyFormProps {
@@ -190,6 +226,21 @@ function PropertyForm({ property, onSave, onCancel, saving }: PropertyFormProps)
         </div>
       </FormSection>
       
+      {/* iCal 연동 */}
+      <FormSection title="📅 iCal 연동">
+        <TextField
+          label="iCal URL"
+          value={form.ical_url}
+          onChange={(v) => update("ical_url", v)}
+          placeholder="https://www.airbnb.co.kr/calendar/ical/xxxxx.ics?s=xxxxx"
+        />
+        <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+          Airbnb → 달력 → 달력 내보내기에서 iCal 링크를 복사하세요.
+          <br />
+          설정 후 달력 페이지에서 동기화하면 차단된 날짜가 표시됩니다.
+        </div>
+      </FormSection>
+      
       {/* 체크인/체크아웃 */}
       <FormSection title="🕐 체크인/체크아웃">
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px" }}>
@@ -227,6 +278,16 @@ function PropertyForm({ property, onSave, onCancel, saving }: PropertyFormProps)
           value={form.address_summary}
           onChange={(v) => update("address_summary", v)}
           placeholder="애월읍 해안도로 인근"
+        />
+        <SelectField
+          label="🔒 주소 노출 정책"
+          value={form.address_disclosure_policy || "checkin_day"}
+          onChange={(v) => update("address_disclosure_policy", v)}
+          options={[
+            { value: "checkin_day", label: "체크인 당일부터 노출 (기본값)" },
+            { value: "always", label: "예약 확정 시점부터 노출" },
+          ]}
+          helpText="AI 자동응답 시 상세 주소를 언제부터 게스트에게 안내할지 설정합니다."
         />
         <TextField
           label="위치 안내"
@@ -440,18 +501,93 @@ function PropertyForm({ property, onSave, onCancel, saving }: PropertyFormProps)
             onChange={(v) => update("bbq_available", v)}
           />
         </div>
-        <TextField
-          label="온수풀 요금 안내"
-          value={form.hot_pool_fee_info}
-          onChange={(v) => update("hot_pool_fee_info", v)}
-          placeholder="온수풀 1회 50,000원"
-        />
-        <TextField
-          label="바베큐 안내"
-          value={form.bbq_guide}
-          onChange={(v) => update("bbq_guide", v)}
-          multiline
-        />
+        
+        {/* Pool 구조화 필드 */}
+        {form.has_pool && (
+          <div style={{ 
+            marginLeft: "24px", 
+            paddingLeft: "16px", 
+            borderLeft: "2px solid var(--border)",
+            display: "flex",
+            flexDirection: "column",
+            gap: "12px",
+          }}>
+            <TextField
+              label="수영장/온수풀 이용료"
+              value={form.pool_fee}
+              onChange={(v) => update("pool_fee", v)}
+              placeholder="예: 100,000원"
+            />
+            <TextField
+              label="수영장 예약 안내"
+              value={form.pool_reservation_notice}
+              onChange={(v) => update("pool_reservation_notice", v)}
+              placeholder="예: 최소 2일 전 예약 필요"
+            />
+            <TextField
+              label="수영장 결제 계좌 ⭐"
+              value={form.pool_payment_account}
+              onChange={(v) => update("pool_payment_account", v)}
+              placeholder="예: 카카오뱅크 79420372489 (송대섭)"
+            />
+          </div>
+        )}
+        
+        {/* BBQ 구조화 필드 */}
+        {form.bbq_available && (
+          <div style={{ 
+            marginLeft: "24px", 
+            paddingLeft: "16px", 
+            borderLeft: "2px solid var(--border)",
+            display: "flex",
+            flexDirection: "column",
+            gap: "12px",
+          }}>
+            <TextField
+              label="바베큐 이용료"
+              value={form.bbq_fee}
+              onChange={(v) => update("bbq_fee", v)}
+              placeholder="예: 30,000원 또는 무료"
+            />
+            <TextField
+              label="바베큐 예약/이용 안내"
+              value={form.bbq_reservation_notice}
+              onChange={(v) => update("bbq_reservation_notice", v)}
+              placeholder="예: 최소 1일 전 예약 필요 / 숯과 그릴만 준비"
+            />
+            <TextField
+              label="바베큐 결제 계좌 ⭐"
+              value={form.bbq_payment_account}
+              onChange={(v) => update("bbq_payment_account", v)}
+              placeholder="예: 카카오뱅크 79420372489 (송대섭)"
+            />
+          </div>
+        )}
+        
+        {/* Deprecated 필드 (기존 데이터 호환용, 접힘) */}
+        <details style={{ marginTop: "12px" }}>
+          <summary style={{ 
+            cursor: "pointer", 
+            color: "var(--text-muted)", 
+            fontSize: "12px" 
+          }}>
+            ⚠️ 기존 형식 (Deprecated - 위 구조화된 필드 사용 권장)
+          </summary>
+          <div style={{ marginTop: "12px", opacity: 0.7 }}>
+            <TextField
+              label="온수풀 요금 안내 (기존)"
+              value={form.hot_pool_fee_info}
+              onChange={(v) => update("hot_pool_fee_info", v)}
+              placeholder="온수풀 1회 50,000원"
+            />
+            <TextField
+              label="바베큐 안내 (기존)"
+              value={form.bbq_guide}
+              onChange={(v) => update("bbq_guide", v)}
+              multiline
+            />
+          </div>
+        </details>
       </FormSection>
       
       {/* 정책 */}
@@ -634,6 +770,8 @@ export function PropertiesPage() {
   const [error, setError] = useState<string | null>(null);
   const [mode, setMode] = useState<"list" | "create" | "edit">("list");
   
+  const { showToast } = useToast();
+  
   // Load properties
   const loadProperties = useCallback(async () => {
     setLoading(true);
@@ -681,12 +819,15 @@ export function PropertiesPage() {
         const created = await apiCreateProperty(data);
         setSelectedProperty(created);
         setMode("edit");
+        showToast({ type: "success", title: "숙소가 생성되었습니다." });
       } else {
         await apiUpdateProperty(data.property_code!, data);
+        showToast({ type: "success", title: "저장되었습니다." });
       }
       await loadProperties();
     } catch (e: any) {
       setError(e.message);
+      showToast({ type: "error", title: "저장 실패", message: e.message });
     } finally {
       setSaving(false);
     }
@@ -702,8 +843,10 @@ export function PropertiesPage() {
     try {
       const created = await apiCreateOtaMapping(data);
       setOtaMappings((prev) => [...prev, created]);
+      showToast({ type: "success", title: "리스팅 매핑이 추가되었습니다." });
     } catch (e: any) {
       setError(e.message);
+      showToast({ type: "error", title: "매핑 추가 실패", message: e.message });
     }
   };
   
@@ -711,8 +854,10 @@ export function PropertiesPage() {
     try {
       await apiDeleteOtaMapping(id);
       setOtaMappings((prev) => prev.filter((m) => m.id !== id));
+      showToast({ type: "success", title: "리스팅 매핑이 삭제되었습니다." });
     } catch (e: any) {
       setError(e.message);
+      showToast({ type: "error", title: "매핑 삭제 실패", message: e.message });
     }
   };
   
@@ -751,12 +896,12 @@ export function PropertiesPage() {
         {error && (
           <div
             style={{
-              background: "#fef2f2",
-              border: "1px solid #fca5a5",
-              borderRadius: "8px",
+              background: "var(--danger-bg)",
+              border: "1px solid var(--danger)",
+              borderRadius: "var(--radius)",
               padding: "12px 16px",
               margin: "0 32px 16px",
-              color: "#dc2626",
+              color: "var(--danger)",
             }}
           >
             {error}

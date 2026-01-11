@@ -122,6 +122,10 @@ class ComplaintExtractor:
                 continue
             
             # Complaint 생성
+            # property_code는 reservation_info에서 조회 (Single Source of Truth)
+            from app.services.property_resolver import get_effective_property_code
+            effective_property_code = get_effective_property_code(self._db, conversation.airbnb_thread_id) or ""
+            
             complaint = Complaint(
                 conversation_id=conversation.id,
                 provenance_message_id=message.id,
@@ -130,7 +134,7 @@ class ComplaintExtractor:
                 description=extracted.description,
                 evidence_quote=extracted.evidence_quote,
                 extraction_confidence=extracted.confidence,
-                property_code=conversation.property_code or message.property_code or "",
+                property_code=effective_property_code,  # reservation_info 기반
                 status=ComplaintStatus.open.value,
             )
             self._db.add(complaint)
@@ -143,7 +147,7 @@ class ComplaintExtractor:
                 
                 notification_svc = NotificationService(self._db)
                 notification_svc.create_complaint_alert(
-                    property_code=conversation.property_code or message.property_code or "",
+                    property_code=effective_property_code,  # reservation_info 기반
                     guest_name=message.guest_name or "게스트",
                     category=extracted.category,
                     category_label=COMPLAINT_CATEGORY_LABELS.get(extracted.category, extracted.category),

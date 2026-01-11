@@ -38,6 +38,13 @@ class PropertyProfile(Base):
         nullable=False,
     )
 
+    # 소속 그룹 코드 (NULL이면 독채/그룹 없음)
+    group_code: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+    )
+
     name: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
@@ -66,6 +73,13 @@ class PropertyProfile(Base):
     address_full: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
+    )
+    
+    # 주소 노출 정책: 'always' (예약 확정시) | 'checkin_day' (체크인 당일, 기본값)
+    address_disclosure_policy: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+        default="checkin_day",
     )
 
     # 간단 요약 주소/위치 설명 (기존 필드)
@@ -218,23 +232,58 @@ class PropertyProfile(Base):
         nullable=True,
     )
 
-    # ===== 수영장 / 온수풀 / 바베큐 =====
+    # ===== 수영장 / 온수풀 =====
     has_pool: Mapped[bool | None] = mapped_column(
         Boolean,
         nullable=True,
     )
+    # 기존 컬럼 (하위 호환용, 추후 삭제 예정)
     hot_pool_fee_info: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
     )
+    # 🆕 새 컬럼들 (구조화)
+    pool_fee: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="온수풀 이용료 (예: 100,000원)",
+    )
+    pool_reservation_notice: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="온수풀 예약 조건 (예: 최소 2일 전 예약 필요)",
+    )
+    pool_payment_account: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="온수풀 결제 계좌 (예: 카카오뱅크 79420372489 송대섭)",
+    )
 
+    # ===== 바베큐 =====
     bbq_available: Mapped[bool | None] = mapped_column(
         Boolean,
         nullable=True,
     )
+    # 기존 컬럼 (하위 호환용, 추후 삭제 예정)
     bbq_guide: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
+    )
+    # 🆕 새 컬럼들 (구조화)
+    bbq_fee: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="바베큐 이용료 (예: 30,000원)",
+    )
+    bbq_reservation_notice: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="바베큐 예약 조건 (예: 최소 1일 전 예약 필요)",
+    )
+    bbq_payment_account: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="바베큐 결제 계좌 (예: 카카오뱅크 79420372489 송대섭)",
     )
 
     # ===== 정책/하우스 룰 =====

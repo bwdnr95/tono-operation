@@ -1,19 +1,19 @@
 # backend/app/services/auto_reply_service.py
 """
-TONO AutoReply 엔진 (v3 - Intent 제거, FAQ/Outcome Label 도입)
+TONO AutoReply 엔진 (v4 - Answer Pack 기반 2회 호출)
 
-변경사항:
-  - Intent 분류 시스템 완전 제거
-  - Template 매칭 제거
-  - PropertyProfile + FAQ 기반 LLM 1회 호출
-  - Outcome Label 4축 자동 확정
-  - used_faq_keys 근거 추적
+변경사항 (v4):
+  - Answer Pack 기반 선택적 정보 주입
+  - 2회 LLM 호출: 1차(Key 선택) → 2차(답변 생성)
+  - 토큰 40-60% 절감
+  - Few-shot 필터링 연동 (pack_keys 기반)
 
 설계 원칙:
   - Conversation-first: message_id로 호출되어도 conversation context 포함
   - Human-in-the-loop: 자동 발송 없음, 초안만 생성
   - Safety-first: LLM + Rule 보정으로 민감도 확정
   - Data-driven: 모든 판단은 근거(trace)로 남김
+  - Token-efficient: 필요한 정보만 선택적으로 주입
 """
 from __future__ import annotations
 
@@ -26,14 +26,27 @@ from enum import Enum
 from sqlalchemy.orm import Session
 
 from app.domain.intents import MessageActor, MessageActionability
+from app.domain.enums.answer_pack_keys import (
+    AnswerPackKey,
+    DEFAULT_FALLBACK_KEYS,
+    ANSWER_PACK_KEY_DESCRIPTIONS,
+)
+from app.domain.dtos.answer_pack_dto import AnswerPackResult, KeySelectionResponse
 from app.repositories.messages import IncomingMessageRepository
 from app.repositories.property_profile_repository import PropertyProfileRepository
 from app.repositories.commitment_repository import CommitmentRepository
 from app.repositories.reservation_info_repository import ReservationInfoRepository
 from app.services.closing_message_detector import ClosingMessageDetector
+from app.services.property_answer_pack_service import PropertyAnswerPackService
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# ══════════════════════════════════════════════════════════════
+# Model Configuration (2회 호출용)
+# ══════════════════════════════════════════════════════════════
+MODEL_KEY_SELECTOR = "gpt-4o-mini"  # 1차: 저렴한 모델 (Key 선택)
+MODEL_REPLY_GENERATOR = "gpt-4.1"   # 2차: 품질 모델 (답변 생성)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -115,6 +128,9 @@ class DraftSuggestion:
     
     # LLM에 실제 들어간 게스트 메시지 (연속 메시지 병합된 상태)
     guest_message: Optional[str] = None
+    
+    # 🆕 선택된 Answer Pack Keys (추적용)
+    selected_pack_keys: Optional[List[str]] = None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -142,10 +158,13 @@ class AutoReplyService:
         self._reservation_repo = ReservationInfoRepository(db)
         self.closing_detector = ClosingMessageDetector()
         
+        # 🆕 Answer Pack Service (Tool Layer)
+        self._pack_service = PropertyAnswerPackService(db)
+        
         # OpenAI 클라이언트 (DI)
         self._client = openai_client
         # 자동응답 생성용 모델 (품질 중요)
-        self._model = settings.LLM_MODEL_REPLY or settings.LLM_MODEL or "gpt-4.1"
+        self._model = settings.LLM_MODEL_REPLY or settings.LLM_MODEL or MODEL_REPLY_GENERATOR
 
     # ══════════════════════════════════════════════════════════════
     # Public API
@@ -186,10 +205,39 @@ class AutoReplyService:
             logger.info("SKIP(non-needs-reply): message_id=%s", message_id)
             return None
 
-        # property_code 확보
-        resolved_property_code = property_code or msg.property_code
-        if not resolved_property_code:
-            logger.warning("SKIP(no-property-code): message_id=%s", message_id)
+        # ═══════════════════════════════════════════════════════════════
+        # Property/Group 조회 (Single Source of Truth: reservation_info)
+        # ═══════════════════════════════════════════════════════════════
+        from app.services.property_resolver import PropertyResolver
+        
+        resolver = PropertyResolver(self._db)
+        resolved = resolver.resolve_with_message_fallback(
+            airbnb_thread_id=msg.airbnb_thread_id,
+            message_property_code=property_code or msg.property_code,  # API에서 전달받은 값 또는 메시지 스냅샷
+        )
+        
+        resolved_property_code = resolved.property_code
+        resolved_group_code = resolved.group_code
+        
+        # group_code만 있고 property_code가 없으면, 그룹의 첫 번째 property를 대표로 사용
+        if not resolved_property_code and resolved_group_code:
+            from app.repositories.property_group_repository import PropertyGroupRepository
+            group_repo = PropertyGroupRepository(self._db)
+            first_property = group_repo.get_first_property_code(resolved_group_code)
+            if first_property:
+                resolved_property_code = first_property
+                logger.info(
+                    f"AUTO_REPLY: Using group's first property: "
+                    f"group_code={resolved_group_code}, property_code={resolved_property_code}"
+                )
+        
+        # property_code도 group_code도 없으면 처리 불가
+        if not resolved_property_code and not resolved_group_code:
+            logger.warning(
+                "SKIP(no-property-or-group): message_id=%s, source=%s",
+                message_id,
+                resolved.source,
+            )
             return None
 
         # 🆕 연속 게스트 메시지 병합 (호스트 답변 없이 연속된 메시지들)
@@ -213,21 +261,53 @@ class AutoReplyService:
         if closing.is_closing:
             return self._create_closing_suggestion(message_id, locale, current_message)
 
-        # 1) Context 구성 (Conversation-first)
-        context = self._build_conversation_context(
+        # ═══════════════════════════════════════════════════════════════
+        # 2회 호출 패턴 (Answer Pack 기반)
+        # ═══════════════════════════════════════════════════════════════
+        
+        # 1) 예약 상태 계산 (ADDRESS_DETAIL 노출 조건용)
+        reservation_status = self._calculate_reservation_status(msg.airbnb_thread_id)
+        
+        # group_code는 위에서 이미 조회됨
+        group_code = resolved_group_code
+        
+        # 2) 1차 호출: 필요한 pack_keys 결정 (gpt-4o-mini)
+        required_keys = await self._determine_required_keys(guest_message)
+        
+        # Fallback 처리 (전체 주입 금지)
+        if not required_keys:
+            required_keys = DEFAULT_FALLBACK_KEYS
+            logger.info(f"AUTO_REPLY: Using fallback keys for message_id={message_id}")
+        
+        # 3) Tool Layer로 정보 조회 (🆕 group_code 전달)
+        answer_pack = self._pack_service.get_pack(
+            property_code=resolved_property_code,
+            keys=required_keys,
+            reservation_status=reservation_status,
+            group_code=group_code,  # 🆕 그룹 코드 전달 (property 없을 때 fallback)
+        )
+        
+        # 4) Context 구성 (Conversation-first, 경량화)
+        context = self._build_conversation_context_v4(
             message_id=message_id,
             airbnb_thread_id=msg.airbnb_thread_id,
             property_code=resolved_property_code,
         )
-
-        # 2) LLM 호출 (답변 + Outcome Label)
-        llm_result = await self._generate_with_llm(
+        
+        # 5) Few-shot 조회 (pack_keys 기반 필터링)
+        few_shots = self._get_filtered_few_shots(guest_message, required_keys, resolved_property_code)
+        
+        # 6) 2차 호출: 최종 답변 생성 (gpt-4.1)
+        llm_result = await self._generate_with_answer_pack(
             guest_message=guest_message,
+            answer_pack=answer_pack,
+            few_shots=few_shots,
             context=context,
+            reservation_status=reservation_status,
             locale=locale,
         )
 
-        # 3) Rule 보정
+        # 7) Rule 보정
         final_outcome = self._apply_rule_corrections(
             llm_outcome=llm_result["outcome_label"],
             guest_message=guest_message,
@@ -239,6 +319,7 @@ class AutoReplyService:
             outcome_label=final_outcome,
             generation_mode="llm",
             guest_message=guest_message,  # 병합된 게스트 메시지 포함
+            selected_pack_keys=[k.value for k in required_keys],  # 🆕 추적용
         )
 
     # ══════════════════════════════════════════════════════════════
@@ -986,3 +1067,425 @@ RESERVATION_STATUS: {reservation_status}
         if locale.startswith("ko"):
             return "안녕하세요, 문의 주셔서 감사합니다. 확인 후 안내드리겠습니다."
         return "Thank you for your message. We will review your request and get back to you."
+
+    # ══════════════════════════════════════════════════════════════
+    # Answer Pack 기반 2회 호출 (v4)
+    # ══════════════════════════════════════════════════════════════
+
+    def _calculate_reservation_status(self, airbnb_thread_id: str) -> str:
+        """예약 상태 계산 (ADDRESS_DETAIL 노출 조건용)"""
+        from datetime import date
+        
+        reservation = self._reservation_repo.get_by_airbnb_thread_id(airbnb_thread_id)
+        if not reservation:
+            return "UNKNOWN"
+        
+        status = (reservation.status or "").upper()
+        
+        # status가 명시적으로 체크아웃/체크인 완료인 경우
+        if status in ["CHECKED_OUT", "CHECKOUT", "COMPLETED"]:
+            return "CHECKED_OUT"
+        elif status in ["IN_HOUSE", "STAYING", "CHECKED_IN"]:
+            return "IN_HOUSE"
+        
+        # 날짜 기반 판단
+        today = date.today()
+        try:
+            checkin_date = None
+            checkout_date = None
+            
+            if reservation.checkin_date:
+                checkin_date = date.fromisoformat(str(reservation.checkin_date)[:10])
+            if reservation.checkout_date:
+                checkout_date = date.fromisoformat(str(reservation.checkout_date)[:10])
+            
+            if checkout_date and checkout_date < today:
+                return "CHECKED_OUT"
+            elif checkout_date and checkout_date == today:
+                return "CHECKOUT_DAY"
+            elif checkin_date and checkin_date > today:
+                return "UPCOMING"
+            elif checkin_date and checkin_date == today:
+                return "CHECKIN_DAY"
+            elif checkin_date and checkout_date and checkin_date < today < checkout_date:
+                return "IN_HOUSE"
+        except:
+            pass
+        
+        return "UNKNOWN"
+
+    def _build_conversation_context_v4(
+        self,
+        *,
+        message_id: int,
+        airbnb_thread_id: str,
+        property_code: str,
+    ) -> Dict[str, Any]:
+        """
+        경량화된 컨텍스트 구성 (v4)
+        - PropertyProfile, FAQ 제외 (Answer Pack으로 대체)
+        - 대화 히스토리, Commitment, 예약 정보만 포함
+        """
+        context: Dict[str, Any] = {}
+        
+        # 1. 최근 대화 히스토리 (최근 5개로 축소)
+        recent_messages = self._get_recent_messages(airbnb_thread_id, limit=5)
+        context["conversation_history"] = recent_messages
+        
+        # 2. 확정된 Commitment
+        commitments = self._commitment_repo.get_active_by_thread_id(airbnb_thread_id)
+        if commitments:
+            context["commitments"] = [
+                {
+                    "topic": c.topic,
+                    "type": c.type,
+                    "summary": c.provenance_text,
+                    "status": c.status,
+                }
+                for c in commitments
+            ]
+        
+        # 3. 예약 정보
+        reservation = self._reservation_repo.get_by_airbnb_thread_id(airbnb_thread_id)
+        if reservation:
+            context["reservation"] = {
+                "guest_name": reservation.guest_name,
+                "checkin_date": str(reservation.checkin_date) if reservation.checkin_date else None,
+                "checkout_date": str(reservation.checkout_date) if reservation.checkout_date else None,
+                "guest_count": reservation.guest_count,
+            }
+        
+        return context
+
+    async def _determine_required_keys(self, guest_message: str) -> List[AnswerPackKey]:
+        """
+        1차 LLM 호출: 게스트 메시지 분석 후 필요한 pack_keys 선택
+        
+        Args:
+            guest_message: 게스트 메시지 (연속 메시지 병합됨)
+            
+        Returns:
+            선택된 AnswerPackKey 리스트
+        """
+        if not self._client:
+            logger.warning("AUTO_REPLY: No OpenAI client for key selection")
+            return list(DEFAULT_FALLBACK_KEYS)
+        
+        # Key 설명 목록 생성
+        key_descriptions = "\n".join([
+            f"- {key.value}: {desc}"
+            for key, desc in ANSWER_PACK_KEY_DESCRIPTIONS.items()
+        ])
+        
+        system_prompt = f"""당신은 숙박 게스트 메시지를 분석하여 답변에 필요한 정보 유형을 선택하는 AI입니다.
+
+아래 목록에서 게스트 질문에 답변하기 위해 필요한 key만 선택하세요.
+절대로 목록에 없는 key를 만들지 마세요.
+
+사용 가능한 key:
+{key_descriptions}
+
+규칙:
+1. 게스트 질문에 답변하는 데 꼭 필요한 key만 선택
+2. 모호하면 관련 가능성 있는 key 포함
+3. 종료 인사, 감사 인사는 key 없이 빈 배열 반환
+4. 결제/환불 관련은 선택하지 않음 (별도 처리)
+
+JSON 형식으로 응답:
+{{"keys": ["wifi_info", "checkin_info"]}}"""
+
+        user_prompt = f"게스트 메시지:\n{guest_message}"
+
+        try:
+            resp = self._client.chat.completions.create(
+                model=MODEL_KEY_SELECTOR,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=200,
+            )
+            
+            raw_content = resp.choices[0].message.content or "{}"
+            parsed = json.loads(raw_content)
+            
+            # 유효한 key만 필터링
+            selected_keys = []
+            for key_str in parsed.get("keys", []):
+                try:
+                    key = AnswerPackKey(key_str)
+                    selected_keys.append(key)
+                except ValueError:
+                    logger.warning(f"Invalid pack key from LLM: {key_str}")
+            
+            logger.info(f"KEY_SELECTION: {[k.value for k in selected_keys]}")
+            return selected_keys
+            
+        except Exception as exc:
+            logger.warning(f"KEY_SELECTION_ERROR: {exc}")
+            return list(DEFAULT_FALLBACK_KEYS)
+
+    def _get_filtered_few_shots(
+        self,
+        guest_message: str,
+        pack_keys: List[AnswerPackKey],
+        property_code: str,
+    ) -> str:
+        """
+        pack_keys 기반 Few-shot 예시 필터링
+        
+        Args:
+            guest_message: 게스트 메시지
+            pack_keys: 선택된 pack keys
+            property_code: 숙소 코드
+            
+        Returns:
+            Few-shot 프롬프트 문자열 (없으면 빈 문자열)
+        """
+        try:
+            from app.services.embedding_service import EmbeddingService
+            
+            embedding_service = EmbeddingService(self._db, self._client)
+            
+            # 기본 유사도 검색
+            similar = embedding_service.find_similar_answers(
+                query_text=guest_message,
+                property_code=property_code,
+                limit=5,
+                min_similarity=0.4,
+            )
+            
+            if not similar:
+                return ""
+            
+            # pack_keys 매칭 필터링 (pack_keys 컬럼이 있는 경우)
+            key_values = [k.value for k in pack_keys]
+            filtered = []
+            
+            for ans in similar:
+                # pack_keys 속성이 있고 매칭되는 경우 우선
+                if hasattr(ans, 'pack_keys') and ans.pack_keys:
+                    if any(pk in key_values for pk in ans.pack_keys):
+                        filtered.append(ans)
+                        if len(filtered) >= 2:
+                            break
+                elif len(filtered) < 2:
+                    # pack_keys가 없으면 유사도만으로 선택
+                    filtered.append(ans)
+            
+            if not filtered:
+                filtered = similar[:2]
+            
+            # 프롬프트 형식으로 변환
+            examples = []
+            for i, ans in enumerate(filtered[:2], 1):
+                examples.append(f"""### 과거 사례 {i} (유사도: {ans.similarity:.0%})
+**게스트 메시지:** {ans.guest_message}
+**승인된 답변:** {ans.final_answer}""")
+            
+            return "\n\n".join(examples)
+            
+        except Exception as e:
+            logger.warning(f"FEW_SHOT_ERROR: {e}")
+            return ""
+
+    async def _generate_with_answer_pack(
+        self,
+        *,
+        guest_message: str,
+        answer_pack: AnswerPackResult,
+        few_shots: str,
+        context: Dict[str, Any],
+        reservation_status: str,
+        locale: str,
+    ) -> Dict[str, Any]:
+        """
+        2차 LLM 호출: Answer Pack 기반 답변 생성
+        
+        Args:
+            guest_message: 게스트 메시지
+            answer_pack: 선택된 정보가 담긴 AnswerPackResult
+            few_shots: Few-shot 예시 문자열
+            context: 경량화된 컨텍스트
+            reservation_status: 예약 상태
+            locale: 응답 언어
+            
+        Returns:
+            {"reply_text": str, "outcome_label": OutcomeLabel}
+        """
+        if not self._client:
+            logger.warning("AUTO_REPLY_SERVICE: No OpenAI client available")
+            return self._fallback_result(locale)
+
+        system_prompt = self._build_system_prompt_v4()
+        user_prompt = self._build_user_prompt_v4(
+            guest_message=guest_message,
+            answer_pack=answer_pack,
+            few_shots=few_shots,
+            context=context,
+            reservation_status=reservation_status,
+        )
+
+        try:
+            resp = self._client.chat.completions.create(
+                model=MODEL_REPLY_GENERATOR,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.4,
+                top_p=1.0,
+                presence_penalty=0.1,
+                frequency_penalty=0.0,
+            )
+            
+            raw_content = resp.choices[0].message.content or "{}"
+            parsed = json.loads(raw_content)
+            
+            return self._parse_llm_response(parsed, locale)
+            
+        except Exception as exc:
+            logger.warning(f"LLM_ERROR (v4): {exc}")
+            return self._fallback_result(locale)
+
+    def _build_system_prompt_v4(self) -> str:
+        """v4 System Prompt (Answer Pack 최적화)"""
+        return """ROLE
+너는 숙소 운영자를 대신해 게스트에게 실제 사람이 보낸 것처럼 자연스럽고 
+신뢰감 있는 답장을 작성한다. 목표는 게스트가 추가 질문 없이, 
+이 메시지 하나로 바로 이해하고 행동할 수 있게 하는 것이다.
+
+답변은:
+- 짧고 명확해야 하며
+- 따뜻하지만 과장되면 안 되고
+- 고객센터 공지문이나 AI 같은 말투가 나면 실패다.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERNAL CONSIDERATION (출력하지 말 것)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PROPERTY_INFO에 있는 정보만 사용해서 답변
+2. PROPERTY_INFO에 없는 내용은 "확인 후 안내드리겠습니다"
+3. 안전 이슈 감지 시: 안부 → 공감 → 조치/안내
+
+4. 게스트의 현재 상태 판단 (중요!)
+   RESERVATION_STATUS는 날짜 기준 추정값이다. 실제 상태는 메시지에서 파악:
+   - "퇴실했습니다", "나왔어요" → 이미 체크아웃
+   - "도착했어요", "들어왔어요" → 이미 체크인
+   - "가는 중이에요", "몇시에 도착해요" → 아직 체크인 전
+   - 시설/물품 관련 질문 → 숙소에 있음
+   RESERVATION_STATUS와 메시지 내용이 다르면, 메시지 내용을 따른다.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WRITING STYLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+정중하고 부드러운 존댓말을 사용한다.
+
+원칙:
+- 문장 끝은 "~습니다", "~입니다", "~세요", "~에요"로 마무리
+- 따뜻하지만 격식있는 느낌 유지
+- 이모지는 :) 😊 정도만 절제해서 사용 (문장당 최대 1개)
+
+권장 흐름:
+① 짧은 인사 ("안녕하세요!")
+② 핵심 정보
+③ (선택) 부드러운 안내 ("확인 부탁드립니다")
+④ 짧은 마무리 ("감사합니다 :)")
+
+금지:
+- 반말, 줄임말, "~요~" 같은 과한 친근함
+- 앵무새 반복: "~라고 하셨는데", "~라는 말씀 잘 알겠습니다"
+- 형식적 표현: "문의 감사드립니다", "안내드립니다", "확인되었습니다"
+- 장문 공지문 스타일
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{
+  "reply_text": "게스트에게 보낼 최종 답장",
+  "outcome": {
+    "response_outcome": "ANSWERED_GROUNDED | DECLINED_BY_POLICY | NEED_FOLLOW_UP | ASK_CLARIFY | CLOSING_MESSAGE | GENERAL_RESPONSE",
+    "operational_outcome": ["NO_OP_ACTION"],
+    "safety_outcome": "SAFE | SENSITIVE | HIGH_RISK",
+    "quality_outcome": "OK_TO_SEND | REVIEW_REQUIRED | LOW_CONFIDENCE"
+  },
+  "used_faq_keys": [],
+  "evidence_quote": ""
+}
+
+outcome 기준:
+- ANSWERED_GROUNDED: PROPERTY_INFO 정보로 구체적 답변 (used_faq_keys 필수)
+- GENERAL_RESPONSE: 정보 참고 없이 일반 응대
+- NEED_FOLLOW_UP: 정보 부족으로 "확인 후 안내"
+- CLOSING_MESSAGE: 종료/감사 인사"""
+
+    def _build_user_prompt_v4(
+        self,
+        guest_message: str,
+        answer_pack: AnswerPackResult,
+        few_shots: str,
+        context: Dict[str, Any],
+        reservation_status: str,
+    ) -> str:
+        """v4 User Prompt (Answer Pack 기반)"""
+        
+        # 1. GUEST_MESSAGE
+        prompt_parts = [f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 GUEST_MESSAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{guest_message.strip()}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESERVATION_STATUS: {reservation_status}"""]
+        
+        # 2. FEW_SHOT_EXAMPLES (있는 경우만)
+        if few_shots:
+            prompt_parts.append(f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 FEW_SHOT_EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{few_shots}""")
+        
+        # 3. PROPERTY_INFO (Answer Pack)
+        pack_dict = answer_pack.to_prompt_dict()
+        if pack_dict:
+            pack_json = json.dumps(pack_dict, ensure_ascii=False, indent=2)
+            prompt_parts.append(f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 PROPERTY_INFO (선택된 정보만)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{pack_json}
+
+⚠️ 위 정보에 없는 내용은 "확인 후 안내드리겠습니다"로 답변.""")
+        
+        # 4. RESERVATION
+        if context.get("reservation"):
+            r = context["reservation"]
+            prompt_parts.append(f"""
+[RESERVATION]
+게스트: {r.get('guest_name', '미확인')}
+체크인: {r.get('checkin_date', '미확인')}
+체크아웃: {r.get('checkout_date', '미확인')}
+인원: {r.get('guest_count', '미확인')}명""")
+        
+        # 5. COMMITMENTS
+        if context.get("commitments"):
+            lines = ["[COMMITMENTS] (이전 약속 - 충돌 금지)"]
+            for c in context["commitments"]:
+                lines.append(f"  • [{c.get('topic')}] {c.get('type')}: {c.get('summary')}")
+            prompt_parts.append("\n".join(lines))
+        
+        # 6. CONVERSATION_HISTORY
+        if context.get("conversation_history"):
+            lines = ["[CONVERSATION_HISTORY]"]
+            for h in context["conversation_history"][-3:]:
+                msg_preview = h['message'][:60] + "..." if len(h['message']) > 60 else h['message']
+                lines.append(f"  {h['speaker']}: {msg_preview}")
+            prompt_parts.append("\n".join(lines))
+        
+        prompt_parts.append("""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+위 정보를 바탕으로 답변을 JSON으로 작성하세요.""")
+        
+        return "\n".join(prompt_parts)

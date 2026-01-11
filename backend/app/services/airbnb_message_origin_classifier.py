@@ -80,7 +80,9 @@ def classify_airbnb_message_origin(
     
     # 🔹 sender_role이 이미 제공된 경우 우선 사용
     if sender_role:
-        if sender_role == "호스트":
+        # 공동 호스트도 호스트로 처리 (정규화가 안됐을 경우 대비)
+        is_host = sender_role == "호스트" or "공동" in sender_role and "호스트" in sender_role
+        if is_host:
             return AirbnbMessageOriginResult(
                 actor=MessageActor.HOST,
                 actionability=MessageActionability.OUTGOING_COPY,

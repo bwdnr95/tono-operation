@@ -65,8 +65,10 @@ def _save_reservation_info(
     - airbnb_thread_id는 메일에서 파싱한 실제 값 사용 (없으면 fallback)
     - status: confirmed (즉시예약) or awaiting_approval (RTB)
     - expires_at: RTB 승인 만료 시간 (RTB일 때만 사용)
+    - group_code: OTA 매핑에서 가져옴 (그룹 매핑인 경우)
     """
     repo = ReservationInfoRepository(db)
+    mapping_repo = OtaListingMappingRepository(db)
     reservation_code = getattr(parsed, "reservation_code", None)
     
     if not reservation_code:
@@ -88,6 +90,23 @@ def _save_reservation_info(
         if status == "awaiting_approval":
             logger.info("Skipping RTB with invalid reservation_code: %s", reservation_code)
             return
+    
+    # ✅ OTA 매핑에서 group_code 조회
+    ota = getattr(parsed, "ota", "airbnb")
+    ota_listing_id = getattr(parsed, "ota_listing_id", None)
+    group_code = None
+    
+    if ota and ota_listing_id:
+        property_code_from_mapping, group_code = mapping_repo.get_property_and_group_codes(
+            ota=ota,
+            listing_id=ota_listing_id,
+            active_only=True,
+        )
+        if group_code:
+            logger.info(
+                "Found group_code from OTA mapping: ota=%s, listing_id=%s, group_code=%s",
+                ota, ota_listing_id, group_code,
+            )
     
     # 1. reservation_code로 기존 레코드 조회
     existing = repo.get_by_reservation_code(reservation_code)
@@ -120,6 +139,7 @@ def _save_reservation_info(
             checkin_time=_parse_time_string(getattr(parsed, "checkin_time", None)),
             checkout_time=_parse_time_string(getattr(parsed, "checkout_time", None)),
             property_code=getattr(parsed, "property_code", None),
+            group_code=group_code,  # ✅ 그룹 코드 추가
             listing_id=getattr(parsed, "ota_listing_id", None),
             listing_name=getattr(parsed, "ota_listing_name", None),
             total_price=getattr(parsed, "total_price", None),
@@ -239,6 +259,7 @@ def _save_reservation_info(
             checkin_time=_parse_time_string(getattr(parsed, "checkin_time", None)),
             checkout_time=_parse_time_string(getattr(parsed, "checkout_time", None)),
             property_code=getattr(parsed, "property_code", None),
+            group_code=group_code,  # ✅ 그룹 코드 추가
             listing_id=getattr(parsed, "ota_listing_id", None),
             listing_name=getattr(parsed, "ota_listing_name", None),
             total_price=getattr(parsed, "total_price", None),
@@ -250,10 +271,11 @@ def _save_reservation_info(
             expires_at=expires_at,
         )
         logger.info(
-            "Created reservation_info: reservation_code=%s, airbnb_thread_id=%s, status=%s",
+            "Created reservation_info: reservation_code=%s, airbnb_thread_id=%s, status=%s, group_code=%s",
             reservation_code,
             airbnb_thread_id,
             status,
+            group_code,
         )
 
 
@@ -329,22 +351,24 @@ def _handle_booking_inquiry(
     else:
         pure_guest_message = extract_guest_message_segment(decoded_text_body or "")
 
-    # property_code 매핑
+    # property_code / group_code 매핑
     property_code = getattr(parsed, "property_code", None)
+    group_code = None
     ota = getattr(parsed, "ota", None)
     ota_listing_id = getattr(parsed, "ota_listing_id", None)
-    if not property_code and ota and ota_listing_id:
+    if ota and ota_listing_id:
         try:
-            mapping = mapping_repo.get_by_ota_listing_id(
+            property_code_from_mapping, group_code = mapping_repo.get_property_and_group_codes(
                 ota=ota,
                 listing_id=ota_listing_id,
                 active_only=True,
             )
-            if mapping is not None:
-                property_code = mapping.property_code
+            # parsed에서 가져온 property_code가 없으면 매핑에서 가져옴
+            if not property_code:
+                property_code = property_code_from_mapping
         except Exception as exc:
             logger.warning(
-                "Booking inquiry: failed to map property_code ota=%s listing_id=%s err=%s",
+                "Booking inquiry: failed to map property_code/group_code ota=%s listing_id=%s err=%s",
                 ota,
                 ota_listing_id,
                 exc,
@@ -370,11 +394,11 @@ def _handle_booking_inquiry(
         checkout_date=getattr(parsed, "checkout_date", None),
     )
 
-    # Conversation upsert
+    # Conversation upsert (property_code 또는 group_code가 있으면 생성)
     conversation = None
-    if not property_code:
+    if not property_code and not group_code:
         logger.warning(
-            "Booking inquiry: skip conversation upsert (no property_code) gmail_message_id=%s",
+            "Booking inquiry: skip conversation upsert (no property_code and no group_code) gmail_message_id=%s",
             gmail_message_id,
         )
     else:
@@ -386,8 +410,10 @@ def _handle_booking_inquiry(
             "reply_via_email_disabled": True,  # 문의는 이메일 답장 불가
         }
         logger.info(
-            "Booking inquiry (email reply disabled): airbnb_thread_id=%s, inquiry_context=%s",
+            "Booking inquiry (email reply disabled): airbnb_thread_id=%s, property_code=%s, group_code=%s, inquiry_context=%s",
             airbnb_thread_id,
+            property_code,
+            group_code,
             inquiry_context,
         )
         
@@ -395,9 +421,39 @@ def _handle_booking_inquiry(
             channel=ConversationChannel.gmail,
             airbnb_thread_id=airbnb_thread_id,
             last_message_id=msg.id,
-            property_code=property_code,
+            property_code=property_code,  # group_code만 있으면 None
             received_at=msg.received_at,
         )
+        
+        # ✅ ReservationInfo 생성 (group_code 포함) - message_processor_service보다 먼저 처리
+        from app.repositories.reservation_info_repository import ReservationInfoRepository
+        reservation_repo = ReservationInfoRepository(db)
+        existing_reservation = reservation_repo.get_by_airbnb_thread_id(airbnb_thread_id)
+        
+        if not existing_reservation:
+            action_url = f"https://www.airbnb.co.kr/hosting/thread/{airbnb_thread_id}?thread_type=home_booking"
+            reservation_repo.create(
+                airbnb_thread_id=airbnb_thread_id,
+                status="inquiry",
+                guest_name=getattr(parsed, "guest_name", None),
+                guest_message=pure_guest_message,
+                guest_count=getattr(parsed, "guest_count", None),
+                checkin_date=getattr(parsed, "checkin_date", None),
+                checkout_date=getattr(parsed, "checkout_date", None),
+                property_code=property_code,
+                group_code=group_code,  # ✅ group_code 저장
+                listing_id=ota_listing_id,
+                listing_name=getattr(parsed, "ota_listing_name", None),
+                source_template="BOOKING_INITIAL_INQUIRY",
+                gmail_message_id=gmail_message_id,
+                action_url=action_url,
+            )
+            logger.info(
+                "Created reservation_info for inquiry: airbnb_thread_id=%s, property_code=%s, group_code=%s",
+                airbnb_thread_id,
+                property_code,
+                group_code,
+            )
 
     # 후처리 (Staff Notification, Draft 생성 등)
     process_result = process_message_after_ingestion(
@@ -1007,21 +1063,24 @@ async def ingest_airbnb_parsed_messages(
         # ✅ Intent 분류 제거됨 (v3)
         # Outcome Label은 draft 생성 시 LLM이 판단
 
+        # property_code / group_code 매핑
         property_code = getattr(parsed, "property_code", None)
+        group_code = None
         ota = getattr(parsed, "ota", None)
         ota_listing_id = getattr(parsed, "ota_listing_id", None)
-        if not property_code and ota and ota_listing_id:
+        if ota and ota_listing_id:
             try:
-                mapping = mapping_repo.get_by_ota_listing_id(
+                property_code_from_mapping, group_code = mapping_repo.get_property_and_group_codes(
                     ota=ota,
                     listing_id=ota_listing_id,
                     active_only=True,
                 )
-                if mapping is not None:
-                    property_code = mapping.property_code
+                # parsed에서 가져온 property_code가 없으면 매핑에서 가져옴
+                if not property_code:
+                    property_code = property_code_from_mapping
             except Exception as exc:
                 logger.warning(
-                    "Failed to map (ota, listing_id) to property_code: ota=%s listing_id=%s err=%s",
+                    "Failed to map (ota, listing_id) to property_code/group_code: ota=%s listing_id=%s err=%s",
                     ota,
                     ota_listing_id,
                     exc,
@@ -1050,9 +1109,9 @@ async def ingest_airbnb_parsed_messages(
         # Lazy Matching: pending 상태의 reservation_info에 airbnb_thread_id 업데이트
         # (CSV 수기 입력으로 airbnb_thread_id 없이 생성된 reservation_info 대응)
         # 
-        # 매칭 기준: property_code + guest_name (부분일치)
-        # - incoming_messages는 예약 정보(checkin/checkout) 책임 X
-        # - reservation_info의 pending 상태만 타겟
+        # 매칭 기준: 
+        # - property_code + guest_name (부분일치)
+        # - group_code만 있는 경우: 그룹 내 property_code들로 확장 매칭
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         guest_name = getattr(parsed, "guest_name", None)
         
@@ -1061,33 +1120,37 @@ async def ingest_airbnb_parsed_messages(
         # 이미 이 airbnb_thread_id로 연결된 reservation_info가 있으면 스킵
         existing_info = reservation_info_repo.get_by_airbnb_thread_id(airbnb_thread_id)
         
-        if not existing_info and property_code:
+        if not existing_info and (property_code or group_code):
             # pending 상태인 CSV 수기 입력 데이터에서 매칭 시도
-            # property_code + guest_name 또는 property_code + checkin_date로 매칭
+            # property_code + guest_name 또는 group_code로 그룹 내 매칭
             checkin_date = getattr(parsed, "checkin_date", None)
             matched = reservation_info_repo.update_pending_reservation_by_lazy_match(
                 property_code=property_code,
                 guest_name=guest_name,
                 airbnb_thread_id=airbnb_thread_id,
                 checkin_date=checkin_date,
+                group_code=group_code,
             )
             if matched:
                 logger.info(
-                    "Lazy matching: matched reservation_code=%s → airbnb_thread_id=%s (guest_name=%s, checkin_date=%s)",
+                    "Lazy matching: matched reservation_code=%s → airbnb_thread_id=%s "
+                    "(property_code=%s, guest_name=%s, checkin_date=%s, group_code=%s)",
                     matched.reservation_code,
                     airbnb_thread_id,
+                    matched.property_code,
                     guest_name,
                     checkin_date,
+                    group_code,
                 )
         
         # NOTE: Fallback reservation_info 생성 제거 (v4)
         # reservation_info는 오직 BOOKING_CONFIRMATION 메일에서만 생성됨
 
-        # Conversation upsert
+        # Conversation upsert (property_code 또는 group_code가 있으면 생성)
         conversation = None
-        if not property_code:
+        if not property_code and not group_code:
             logger.warning(
-                "Airbnb ingestion: skip conversation upsert (no property_code) gmail_message_id=%s",
+                "Airbnb ingestion: skip conversation upsert (no property_code and no group_code) gmail_message_id=%s",
                 gmail_message_id,
             )
         else:
@@ -1095,8 +1158,16 @@ async def ingest_airbnb_parsed_messages(
                 channel=ConversationChannel.gmail,
                 airbnb_thread_id=msg.airbnb_thread_id,
                 last_message_id=msg.id,
-                property_code=property_code,
+                property_code=property_code,  # group_code만 있으면 None
                 received_at=msg.received_at,
+            )
+            
+            logger.info(
+                "Conversation upserted: conversation_id=%s, airbnb_thread_id=%s, property_code=%s, group_code=%s",
+                conversation.id,
+                conversation.airbnb_thread_id,
+                property_code,
+                group_code,
             )
             
             # ✅ 마지막 발화자가 HOST면 → 처리완료 상태로 변경

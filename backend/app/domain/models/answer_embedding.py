@@ -8,11 +8,11 @@ Answer Embedding 모델
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 from uuid import UUID
 
 from sqlalchemy import Boolean, DateTime, String, Text
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID, ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 from pgvector.sqlalchemy import Vector
 
@@ -42,6 +42,12 @@ class AnswerEmbedding(Base):
     was_edited: Mapped[bool] = mapped_column(Boolean, default=False)
     conversation_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     airbnb_thread_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    
+    # 🆕 Answer Pack keys (Few-shot 필터링용)
+    pack_keys: Mapped[Optional[List[str]]] = mapped_column(
+        ARRAY(Text),
+        nullable=True,
+    )
     
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

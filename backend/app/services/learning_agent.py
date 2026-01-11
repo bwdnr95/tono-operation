@@ -209,11 +209,15 @@ class LearningAgent:
                     draft.created_at
                 )
             
+            # property_code는 reservation_info에서 조회 (Single Source of Truth)
+            from app.services.property_resolver import get_effective_property_code
+            effective_property_code = get_effective_property_code(self._db, conv.airbnb_thread_id)
+            
             edit_pairs.append(EditPair(
                 draft_id=str(draft.id),
                 conversation_id=str(conv.id),
                 airbnb_thread_id=conv.airbnb_thread_id,
-                property_code=conv.property_code,
+                property_code=effective_property_code,  # reservation_info 기반
                 original=draft.original_content,
                 edited=draft.content,
                 guest_message=guest_message,

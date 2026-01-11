@@ -10,6 +10,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { PageLayout } from "../layout/PageLayout";
+import { SkeletonConversationList } from "../components/ui/Skeleton";
 
 import {
   getDashboardSummary,
@@ -38,11 +39,12 @@ interface SummaryCardProps {
 }
 
 function SummaryCard({ icon, label, count, color = "default", onClick }: SummaryCardProps) {
+  // 다크모드 지원 CSS 변수 사용
   const colorStyles: Record<string, { bg: string; border: string; text: string }> = {
-    default: { bg: "var(--bg-primary)", border: "var(--border-color)", text: "var(--text-primary)" },
-    warning: { bg: "#fffbeb", border: "#fbbf24", text: "#b45309" },
-    danger: { bg: "#fef2f2", border: "#ef4444", text: "#dc2626" },
-    success: { bg: "#f0fdf4", border: "#22c55e", text: "#16a34a" },
+    default: { bg: "var(--surface)", border: "var(--border)", text: "var(--text)" },
+    warning: { bg: "var(--warning-bg)", border: "var(--warning)", text: "var(--warning)" },
+    danger: { bg: "var(--danger-bg)", border: "var(--danger)", text: "var(--danger)" },
+    success: { bg: "var(--success-bg)", border: "var(--success)", text: "var(--success)" },
   };
   const style = colorStyles[color];
 
@@ -52,7 +54,7 @@ function SummaryCard({ icon, label, count, color = "default", onClick }: Summary
       style={{
         background: style.bg,
         border: `1px solid ${style.border}`,
-        borderRadius: "12px",
+        borderRadius: "var(--radius-lg)",
         padding: "16px 20px",
         cursor: onClick ? "pointer" : "default",
         transition: "transform 0.15s, box-shadow 0.15s",
@@ -61,7 +63,7 @@ function SummaryCard({ icon, label, count, color = "default", onClick }: Summary
       onMouseEnter={(e) => {
         if (onClick) {
           e.currentTarget.style.transform = "translateY(-2px)";
-          e.currentTarget.style.boxShadow = "0 4px 12px rgba(0,0,0,0.1)";
+          e.currentTarget.style.boxShadow = "var(--shadow-md)";
         }
       }}
       onMouseLeave={(e) => {
@@ -90,9 +92,10 @@ function SummaryCard({ icon, label, count, color = "default", onClick }: Summary
 
 interface PendingReservationItemProps {
   item: PendingReservationDTO;
+  onClick?: () => void;
 }
 
-function PendingReservationItem({ item }: PendingReservationItemProps) {
+function PendingReservationItem({ item, onClick }: PendingReservationItemProps) {
   const remainingHours = item.remaining_hours ?? 0;
   const isUrgent = remainingHours <= 6;
   const isExpiring = remainingHours <= 12 && remainingHours > 6;
@@ -110,10 +113,8 @@ function PendingReservationItem({ item }: PendingReservationItemProps) {
 
   return (
     <div
+      onClick={onClick}
       className="conversation-item"
-      style={{
-        background: isUrgent ? "#fef2f2" : isExpiring ? "#fffbeb" : "transparent",
-      }}
     >
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", width: "100%" }}>
         <div style={{ flex: 1 }}>
@@ -138,14 +139,14 @@ function PendingReservationItem({ item }: PendingReservationItemProps) {
           )}
         </div>
         <div style={{ textAlign: "right", marginLeft: "12px" }}>
-          <div style={{ fontSize: "14px", fontWeight: "600", color: "#16a34a", marginBottom: "4px" }}>
+          <div style={{ fontSize: "14px", fontWeight: "600", color: "var(--success)", marginBottom: "4px" }}>
             {formatCurrency(item.expected_payout)}
           </div>
           <div
             style={{
               fontSize: "12px",
               fontWeight: "600",
-              color: isUrgent ? "#dc2626" : isExpiring ? "#f59e0b" : "#6b7280",
+              color: isUrgent ? "var(--danger)" : isExpiring ? "var(--warning)" : "var(--text-secondary)",
               marginBottom: "6px",
             }}
           >
@@ -158,7 +159,7 @@ function PendingReservationItem({ item }: PendingReservationItemProps) {
             onClick={(e) => e.stopPropagation()}
             className="btn btn-sm"
             style={{
-              background: "#ff385c",
+              background: "var(--danger)",
               color: "white",
               padding: "4px 10px",
               fontSize: "11px",
@@ -182,7 +183,7 @@ interface UnansweredMessageItemProps {
 }
 
 function UnansweredMessageItem({ item, onClick }: UnansweredMessageItemProps) {
-  const hours = item.hours_since_last_message;
+  const hours = item.hours_since_last_message ?? 0;
   
   const formatTime = (h: number) => {
     if (h < 1) return "방금 전";
@@ -211,8 +212,8 @@ function UnansweredMessageItem({ item, onClick }: UnansweredMessageItemProps) {
           <span
             className="badge"
             style={{
-              background: hours >= 2 ? "#fef2f2" : hours >= 1 ? "#fffbeb" : "#f0fdf4",
-              color: hours >= 2 ? "#dc2626" : hours >= 1 ? "#b45309" : "#16a34a",
+              background: hours >= 2 ? "var(--danger-bg)" : hours >= 1 ? "var(--warning-bg)" : "var(--success-bg)",
+              color: hours >= 2 ? "var(--danger)" : hours >= 1 ? "var(--warning)" : "var(--success)",
             }}
           >
             {formatTime(hours)}
@@ -232,6 +233,19 @@ interface StaffAlertItemProps {
   onClick: () => void;
 }
 
+// Topic 한글 라벨
+const TOPIC_LABELS: Record<string, string> = {
+  early_checkin: "얼리체크인",
+  late_checkout: "레이트체크아웃",
+  follow_up: "후속 안내",
+  facility_issue: "시설 문제",
+  visit_schedule: "방문 일정",
+  amenity_request: "어메니티 요청",
+  refund: "환불",
+  payment: "결제",
+  compensation: "보상",
+};
+
 function StaffAlertItem({ item, onClick }: StaffAlertItemProps) {
   const formatDate = (dateStr: string | null) => {
     if (!dateStr) return "-";
@@ -239,9 +253,11 @@ function StaffAlertItem({ item, onClick }: StaffAlertItemProps) {
     return `${d.getMonth() + 1}/${d.getDate()}`;
   };
 
+  const topicLabel = TOPIC_LABELS[item.topic] || item.topic;
+
   return (
     <div onClick={onClick} className="conversation-item">
-      <div className="conversation-avatar" style={{ background: "#fef2f2", color: "#dc2626" }}>
+      <div className="conversation-avatar" style={{ background: "var(--danger-bg)", color: "var(--danger)" }}>
         !
       </div>
       <div className="conversation-content">
@@ -254,7 +270,7 @@ function StaffAlertItem({ item, onClick }: StaffAlertItemProps) {
           )}
         </div>
         <div className="conversation-preview">
-          {item.alert_reason}
+          [{topicLabel}] {item.description}
         </div>
         <div className="conversation-meta">
           <span className="badge badge-warning">
@@ -309,13 +325,45 @@ export function DashboardPage() {
     fetchData();
   }, [fetchData]);
 
+  // ===== Auto Refresh (5분마다) =====
+  useEffect(() => {
+    const REFRESH_INTERVAL = 5 * 60 * 1000; // 5분
+    
+    const interval = setInterval(() => {
+      if (!loading) {
+        fetchData();
+      }
+    }, REFRESH_INTERVAL);
+    
+    return () => clearInterval(interval);
+  }, [loading, fetchData]);
+
+  // ===== 탭 포커스 시 새로고침 =====
+  useEffect(() => {
+    let lastRefresh = Date.now();
+    const MIN_REFRESH_GAP = 30 * 1000; // 최소 30초 간격
+    
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        const now = Date.now();
+        if (now - lastRefresh > MIN_REFRESH_GAP && !loading) {
+          lastRefresh = now;
+          fetchData();
+        }
+      }
+    };
+    
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [loading, fetchData]);
+
   // Handlers
   const handleUnansweredClick = (item: UnansweredMessageDTO) => {
     navigate(`/inbox?conversation_id=${item.conversation_id}`);
   };
 
   const handleStaffAlertClick = (item: StaffAlertDTO) => {
-    navigate(`/inbox?conversation_id=${item.conversation_id}`);
+    navigate(`/staff-notifications?oc_id=${item.oc_id}`);
   };
 
   // Render
@@ -323,15 +371,15 @@ export function DashboardPage() {
     <PageLayout>
       <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
         {/* Page Header - InboxPage 스타일 */}
-        <header className="page-header">
+        <header className="page-header dashboard-header">
           <div className="page-header-content">
             <div>
               <h1 className="page-title">대시보드</h1>
               <p className="page-subtitle">운영 현황을 한눈에 확인하세요</p>
             </div>
-            <div style={{ display: "flex", gap: "8px" }}>
-              <button onClick={fetchData} disabled={loading} className="btn btn-secondary">
-                {loading ? "로딩..." : "새로고침"}
+            <div className="dashboard-header-actions" style={{ display: "flex", gap: "8px" }}>
+              <button onClick={fetchData} disabled={loading} className="btn btn-secondary dashboard-refresh-btn">
+                {loading ? "⟳" : "↻"}
               </button>
             </div>
           </div>
@@ -341,12 +389,12 @@ export function DashboardPage() {
         {error && (
           <div
             style={{
-              background: "#fef2f2",
-              border: "1px solid #fca5a5",
-              borderRadius: "8px",
+              background: "var(--danger-bg)",
+              border: "1px solid var(--danger)",
+              borderRadius: "var(--radius)",
               padding: "12px 16px",
               margin: "0 32px 16px",
-              color: "#dc2626",
+              color: "var(--danger)",
             }}
           >
             {error}
@@ -356,10 +404,11 @@ export function DashboardPage() {
         {/* Summary Cards */}
         {summary && (
           <div
+            className="dashboard-summary-cards"
             style={{
               display: "flex",
               gap: "16px",
-              padding: "0 32px 24px",
+              padding: "24px 32px",
               overflowX: "auto",
             }}
           >
@@ -368,6 +417,7 @@ export function DashboardPage() {
               label="예약 요청"
               count={summary.pending_reservations_count}
               color={summary.pending_reservations_count > 0 ? "warning" : "default"}
+              onClick={() => navigate("/booking-requests")}
             />
             <SummaryCard
               icon="💬"
@@ -399,10 +449,10 @@ export function DashboardPage() {
         )}
 
         {/* Main Content - InboxPage 스타일 레이아웃 */}
-        <div style={{ flex: 1, padding: "0 32px 32px", display: "flex", flexDirection: "column", gap: "20px", minHeight: 0 }}>
+        <div className="dashboard-main-content" style={{ flex: 1, padding: "0 32px 32px", display: "flex", flexDirection: "column", gap: "20px", minHeight: 0 }}>
           
           {/* 미응답 메시지 - 전체 너비 */}
-          <div className="card" style={{ flex: 1, minHeight: "200px", display: "flex", flexDirection: "column" }}>
+          <div className="card dashboard-card" style={{ flex: 1, minHeight: "200px", display: "flex", flexDirection: "column" }}>
             <div className="card-header">
               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                 <span>💬</span>
@@ -422,9 +472,7 @@ export function DashboardPage() {
             </div>
             <div style={{ flex: 1, overflowY: "auto" }}>
               {loading ? (
-                <div className="empty-state">
-                  <div className="loading-spinner" />
-                </div>
+                <SkeletonConversationList count={4} />
               ) : unansweredMessages.length === 0 ? (
                 <div className="empty-state">
                   <div className="empty-state-icon">✓</div>
@@ -443,9 +491,9 @@ export function DashboardPage() {
           </div>
 
           {/* 예약 요청 + Staff Alerts - 50:50 */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px", flex: 1, minHeight: "200px" }}>
+          <div className="dashboard-grid-2col" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px", flex: 1, minHeight: "200px" }}>
             {/* 예약 요청 */}
-            <div className="card" style={{ display: "flex", flexDirection: "column" }}>
+            <div className="card dashboard-card" style={{ display: "flex", flexDirection: "column" }}>
               <div className="card-header">
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                   <span>📩</span>
@@ -456,12 +504,16 @@ export function DashboardPage() {
                     </span>
                   )}
                 </div>
+                <button
+                  onClick={() => navigate("/booking-requests")}
+                  className="btn btn-ghost btn-sm"
+                >
+                  전체 보기 →
+                </button>
               </div>
               <div style={{ flex: 1, overflowY: "auto" }}>
                 {loading ? (
-                  <div className="empty-state">
-                    <div className="loading-spinner" />
-                  </div>
+                  <SkeletonConversationList count={3} />
                 ) : pendingReservations.length === 0 ? (
                   <div className="empty-state">
                     <div className="empty-state-icon">✓</div>
@@ -469,14 +521,18 @@ export function DashboardPage() {
                   </div>
                 ) : (
                   pendingReservations.map((item) => (
-                    <PendingReservationItem key={item.id} item={item} />
+                    <PendingReservationItem 
+                      key={item.id} 
+                      item={item} 
+                      onClick={() => navigate(`/booking-requests?id=${item.id}`)}
+                    />
                   ))
                 )}
               </div>
             </div>
 
             {/* Staff Alerts */}
-            <div className="card" style={{ display: "flex", flexDirection: "column" }}>
+            <div className="card dashboard-card" style={{ display: "flex", flexDirection: "column" }}>
               <div className="card-header">
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                   <span>🔔</span>
@@ -496,9 +552,7 @@ export function DashboardPage() {
               </div>
               <div style={{ flex: 1, overflowY: "auto" }}>
                 {loading ? (
-                  <div className="empty-state">
-                    <div className="loading-spinner" />
-                  </div>
+                  <SkeletonConversationList count={3} />
                 ) : staffAlerts.length === 0 ? (
                   <div className="empty-state">
                     <div className="empty-state-icon">✓</div>

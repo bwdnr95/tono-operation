@@ -26,6 +26,7 @@ from app.domain.models.conversation import (
 )
 from app.domain.models.incoming_message import IncomingMessage, MessageDirection
 from app.domain.models.reservation_info import ReservationInfo
+from app.domain.models.property_profile import PropertyProfile
 from app.services.auto_reply_service import AutoReplyService
 from app.services.email_ingestion_service import ingest_airbnb_parsed_messages
 
@@ -131,21 +132,56 @@ def list_conversations(
             .limit(1)
         ).scalar_one_or_none()
         
+        # guest_name 결정: reservation_info에서 먼저, 없으면 incoming_message에서
+        guest_name = reservation.guest_name if reservation else None
+        if not guest_name:
+            # incoming_messages에서 guest_name 조회
+            last_msg = db.execute(
+                select(IncomingMessage)
+                .where(IncomingMessage.airbnb_thread_id == r.airbnb_thread_id)
+                .order_by(desc(IncomingMessage.received_at))
+                .limit(1)
+            ).scalar_one_or_none()
+            if last_msg:
+                guest_name = last_msg.guest_name
+        
+        # property_code 결정
+        property_code = r.property_code or (reservation.property_code if reservation else None)
+        
+        # group_code 결정: reservation에서 먼저, 없으면 property에서 가져옴
+        group_code = reservation.group_code if reservation else None
+        
+        # effective_group_code 계산: group_code가 없어도 property의 group_code 반영
+        effective_group_code = group_code
+        if not effective_group_code and property_code:
+            prop = db.execute(
+                select(PropertyProfile)
+                .where(PropertyProfile.property_code == property_code)
+            ).scalar_one_or_none()
+            if prop:
+                effective_group_code = prop.group_code
+        
+        # can_reassign: effective_group_code가 있으면 재배정 가능
+        can_reassign = effective_group_code is not None
+        
         items.append(ConversationListItemDTO(
             id=r.id,
             channel=r.channel.value,
             airbnb_thread_id=r.airbnb_thread_id,
-            property_code=r.property_code or (reservation.property_code if reservation else None),
+            property_code=property_code,
+            group_code=group_code,
             status=r.status.value,
             safety_status=_safety_literal(r.safety_status),
             is_read=r.is_read,
             last_message_id=r.last_message_id,
             updated_at=r.updated_at,
-            guest_name=reservation.guest_name if reservation else None,
+            guest_name=guest_name,  # reservation 또는 incoming_message에서 가져온 값
             checkin_date=str(reservation.checkin_date) if reservation and reservation.checkin_date else None,
             checkout_date=str(reservation.checkout_date) if reservation and reservation.checkout_date else None,
             reservation_status=reservation.status if reservation else None,
             last_send_action=last_send_log.action.value if last_send_log else None,
+            effective_group_code=effective_group_code,
+            can_reassign=can_reassign,
         ))
     
     return ConversationListResponse(items=items, next_cursor=next_cursor)
@@ -285,22 +321,53 @@ def get_conversation(conversation_id: UUID, db: Session = Depends(get_db)):
             ],
         )
 
+    # property_code, group_code 결정 (Single Source of Truth: reservation_info)
+    from app.services.property_resolver import PropertyResolver
+    resolved = PropertyResolver(db).resolve(conv.airbnb_thread_id)
+    property_code = resolved.property_code
+    group_code = resolved.group_code
+    
+    # effective_group_code 계산: group_code가 없어도 property의 group_code 반영
+    effective_group_code = group_code
+    if not effective_group_code and property_code:
+        prop = db.execute(
+            select(PropertyProfile)
+            .where(PropertyProfile.property_code == property_code)
+        ).scalar_one_or_none()
+        if prop:
+            effective_group_code = prop.group_code
+    
+    # can_reassign: effective_group_code가 있으면 재배정 가능
+    can_reassign = effective_group_code is not None
+    
+    # guest_name 결정: reservation_info에서 먼저, 없으면 incoming_message에서
+    guest_name = reservation.guest_name if reservation else None
+    if not guest_name and msgs:
+        # 가장 최근 메시지에서 guest_name 조회
+        for m in reversed(msgs):
+            if m.guest_name:
+                guest_name = m.guest_name
+                break
+
     return ConversationDetailResponse(
         conversation=ConversationDTO(
             id=conv.id,
             channel=conv.channel.value,
             airbnb_thread_id=conv.airbnb_thread_id,
-            property_code=conv.property_code or (reservation.property_code if reservation else None),
+            property_code=property_code,
+            group_code=group_code,
             status=conv.status.value,
             safety_status=_safety_literal(conv.safety_status),
             is_read=conv.is_read,
             last_message_id=conv.last_message_id,
             created_at=conv.created_at,
             updated_at=conv.updated_at,
-            guest_name=reservation.guest_name if reservation else None,
+            guest_name=guest_name,  # reservation 또는 incoming_message에서 가져온 값
             checkin_date=str(reservation.checkin_date) if reservation and reservation.checkin_date else None,
             checkout_date=str(reservation.checkout_date) if reservation and reservation.checkout_date else None,
             reservation_status=reservation.status if reservation else None,
+            effective_group_code=effective_group_code,
+            can_reassign=can_reassign,
         ),
         messages=[
             ConversationMessageDTO(
@@ -362,6 +429,21 @@ async def generate_draft(conversation_id: UUID, body: DraftGenerateRequest, db: 
     if not last_guest_msg:
         raise HTTPException(status_code=400, detail="No guest message found in thread")
 
+    # property_code 결정: reservation_info > incoming_message > conversation
+    # (객실 배정 후에도 incoming_message.property_code는 NULL일 수 있음)
+    resolved_property_code = last_guest_msg.property_code
+    if not resolved_property_code:
+        reservation = db.execute(
+            select(ReservationInfo)
+            .where(ReservationInfo.airbnb_thread_id == conv.airbnb_thread_id)
+        ).scalar_one_or_none()
+        if reservation:
+            resolved_property_code = reservation.property_code
+    
+    # 🆕 Fallback: conversation.property_code (레거시 데이터 대응)
+    if not resolved_property_code:
+        resolved_property_code = conv.property_code
+
     from app.adapters.llm_client import get_openai_client
     openai_client = get_openai_client()
     auto_reply_service = AutoReplyService(db=db, openai_client=openai_client)
@@ -369,7 +451,7 @@ async def generate_draft(conversation_id: UUID, body: DraftGenerateRequest, db: 
         message_id=last_guest_msg.id,
         ota=last_guest_msg.ota or "airbnb",
         locale="ko",
-        property_code=last_guest_msg.property_code,
+        property_code=resolved_property_code,  # 🔧 수정: reservation_info에서 가져온 property_code 사용
         use_llm=True,
     )
 
@@ -502,19 +584,39 @@ async def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Dep
     # Decision 판단
     decision_result = await orchestrator.evaluate_draft(evidence)
     
-    # BLOCK이면 발송 차단
+    # ═══════════════════════════════════════════════════════════════
+    # 🆕 수동 발송 BLOCK 처리 로직
+    # - SAFETY_CONCERN, POLICY_VIOLATION → 절대 차단 (보안 이슈)
+    # - HIGH_RISK_KEYWORDS, SENSITIVE_TOPIC → 경고만 (수동 발송 허용)
+    # ═══════════════════════════════════════════════════════════════
+    from app.domain.models.orchestrator import ReasonCode
+    
     if decision_result.decision == Decision.BLOCK:
-        return SendResponse(
-            conversation_id=conv.id,
-            status="blocked",
-            decision=decision_result.decision.value,
-            reason_codes=[rc.value for rc in decision_result.reason_codes],
-            warnings=[
-                OrchestratorWarningDTO(code=rc.value, message=f"차단 사유: {rc.value}", severity="error")
-                for rc in decision_result.reason_codes
-            ],
-            decision_log_id=decision_result.decision_log_id,
-        )
+        # 절대 차단해야 하는 reason codes
+        hard_block_codes = {ReasonCode.SAFETY_CONCERN, ReasonCode.POLICY_VIOLATION}
+        
+        # 현재 reason_codes 중 hard block이 있는지 확인
+        has_hard_block = any(rc in hard_block_codes for rc in decision_result.reason_codes)
+        
+        if has_hard_block:
+            # 안전/정책 위반 → 절대 차단
+            return SendResponse(
+                conversation_id=conv.id,
+                status="blocked",
+                decision=decision_result.decision.value,
+                reason_codes=[rc.value for rc in decision_result.reason_codes],
+                warnings=[
+                    OrchestratorWarningDTO(code=rc.value, message=f"차단 사유: {rc.value}", severity="error")
+                    for rc in decision_result.reason_codes
+                ],
+                decision_log_id=decision_result.decision_log_id,
+            )
+        else:
+            # HIGH_RISK_KEYWORDS, SENSITIVE_TOPIC 등 → 경고만 (발송 진행)
+            logger.warning(
+                f"Manual send proceeding with risk warning: conv_id={conv.id}, "
+                f"reason_codes={[rc.value for rc in decision_result.reason_codes]}"
+            )
     
     # 🚧 임시 비활성화: Orchestrator requires_human 체크
     # TODO: 프론트엔드 확인 UI 구현 후 활성화
@@ -675,11 +777,17 @@ async def send_reply(conversation_id: UUID, body: SendRequest, db: Session = Dep
             or ""
         )
         
+        # 🔧 property_code: PropertyResolver로 조회 (reservation_info 우선)
+        # incoming_message.property_code가 비어있는 경우가 있어서 reservation_info에서 가져옴
+        from app.services.property_resolver import PropertyResolver
+        resolved = PropertyResolver(db).resolve(conv.airbnb_thread_id)
+        effective_property_code = resolved.property_code or resolved.group_code or ""
+        
         # await로 직접 호출 (DB 세션이 열려있는 동안 완료)
         await send_handler.on_message_sent(
             sent_text=draft.content,
             airbnb_thread_id=conv.airbnb_thread_id,
-            property_code=last_incoming.property_code or "",
+            property_code=effective_property_code,
             message_id=out_msg.id,
             conversation_id=conv.id,
             guest_checkin_date=last_incoming.checkin_date,  # OC target_date 계산용
@@ -827,11 +935,15 @@ async def ingest_gmail_and_generate_drafts(
             continue
 
         # LLM으로 Draft 생성 (새 conversation만)
+        # property_code는 reservation_info에서 조회 (Single Source of Truth)
+        from app.services.property_resolver import get_effective_property_code
+        effective_prop = get_effective_property_code(db, airbnb_thread_id)
+        
         try:
             suggestion = await auto_reply_service.suggest_reply_for_message(
                 message_id=last_guest_msg.id,
                 locale="ko",
-                property_code=last_guest_msg.property_code,
+                property_code=effective_prop,  # reservation_info 기반
             )
             
             if suggestion and suggestion.reply_text:

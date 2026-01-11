@@ -188,7 +188,7 @@ export function OutcomeLabelCard({ outcomeLabel, humanOverride, onOverride, expa
 
           {humanOverride?.applied && (
             <div style={{ 
-              background: "rgba(99, 102, 241, 0.1)", 
+              background: "var(--primary-bg)", 
               borderRadius: "var(--radius)", 
               padding: "8px 12px",
               marginBottom: "12px"

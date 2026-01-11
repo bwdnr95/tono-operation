@@ -82,6 +82,7 @@ class ReservationInfo(Base):
     
     # 숙소 정보
     property_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    group_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)  # 예약 시점 그룹 코드
     listing_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     listing_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     

@@ -53,6 +53,7 @@ class ReservationInfoRepository:
         checkin_time: Optional[time] = None,
         checkout_time: Optional[time] = None,
         property_code: Optional[str] = None,
+        group_code: Optional[str] = None,
         listing_id: Optional[str] = None,
         listing_name: Optional[str] = None,
         total_price: Optional[int] = None,
@@ -78,6 +79,7 @@ class ReservationInfoRepository:
             checkin_time=checkin_time,
             checkout_time=checkout_time,
             property_code=property_code,
+            group_code=group_code,
             listing_id=listing_id,
             listing_name=listing_name,
             total_price=total_price,
@@ -353,10 +355,11 @@ class ReservationInfoRepository:
 
     def update_pending_reservation_by_lazy_match(
         self,
-        property_code: str,
+        property_code: Optional[str],
         guest_name: Optional[str],
         airbnb_thread_id: str,
         checkin_date: Optional[date] = None,
+        group_code: Optional[str] = None,
     ) -> Optional[ReservationInfo]:
         """
         pending 상태이거나 airbnb_thread_id가 MANUAL_/pending_으로 시작하는 예약을
@@ -371,6 +374,10 @@ class ReservationInfoRepository:
         2. property_code + checkin_date (호스트/공동호스트 메시지용)
         3. property_code만 (단일 pending만 있을 때)
         
+        group_code만 있는 경우:
+        - group_code에 속한 property_code들(LIKE 'group_code%')로 확장하여 매칭
+        - 수기 입력된 예약은 이미 숙소 배정이 되어있어 property_code가 있음
+        
         Returns:
             업데이트된 ReservationInfo, 없으면 None
             
@@ -379,6 +386,10 @@ class ReservationInfoRepository:
         """
         info = None
         
+        # property_code도 group_code도 없으면 매칭 불가
+        if not property_code and not group_code:
+            return None
+        
         # 매칭 조건: status가 pending이거나, airbnb_thread_id가 MANUAL_/pending_으로 시작
         pending_condition = or_(
             ReservationInfo.status == "pending",
@@ -386,22 +397,43 @@ class ReservationInfoRepository:
             ReservationInfo.airbnb_thread_id.like("pending_%"),
         )
         
+        # property_code 조건 설정
+        # - property_code가 있으면 정확히 일치
+        # - group_code만 있으면 그룹에 속한 모든 property_code (LIKE 'group_code%')
+        if property_code:
+            property_condition = ReservationInfo.property_code == property_code
+        else:
+            # group_code만 있는 경우: 해당 그룹의 property_code들로 매칭
+            # 예: group_code="2NH" → property_code LIKE "2NH%"
+            property_condition = ReservationInfo.property_code.like(f"{group_code}%")
+        
         # 1차: guest_name 부분일치 포함
         if guest_name:
             # guest_name 정규화 (공백 제거, 대소문자 무시)
             normalized_name = guest_name.strip()
             stmt = select(ReservationInfo).where(
                 pending_condition,
-                ReservationInfo.property_code == property_code,
+                property_condition,
                 ReservationInfo.guest_name.ilike(f"%{normalized_name}%"),
             )
-            info = self.db.execute(stmt).scalar_one_or_none()
+            results = list(self.db.execute(stmt).scalars().all())
+            
+            if len(results) == 1:
+                info = results[0]
+            elif len(results) > 1:
+                # 동일 이름으로 여러 건 → checkin_date로 추가 필터
+                if checkin_date:
+                    for r in results:
+                        if r.checkin_date == checkin_date:
+                            info = r
+                            break
+                # 그래도 못 찾으면 None (모호함)
         
         # 2차: checkin_date 매칭 (호스트/공동호스트 메시지용)
         if not info and checkin_date:
             stmt = select(ReservationInfo).where(
                 pending_condition,
-                ReservationInfo.property_code == property_code,
+                property_condition,
                 ReservationInfo.checkin_date == checkin_date,
             )
             results = list(self.db.execute(stmt).scalars().all())
@@ -410,18 +442,20 @@ class ReservationInfoRepository:
                 info = results[0]
             elif len(results) > 1:
                 # 🚨 오버부킹 의심 → 알림 발송, 매칭 스킵
+                # group_code로 매칭한 경우 첫 번째 property_code 사용
+                first_property = results[0].property_code if results else (property_code or group_code)
                 self._notify_overbooking(
-                    property_code=property_code,
+                    property_code=first_property,
                     checkin_date=checkin_date,
                     reservations=results,
                 )
                 return None
         
-        # 3차 fallback: guest_name 없이 (단일 pending만 있을 때)
+        # 3차 fallback: guest_name, checkin_date 없이 (단일 pending만 있을 때)
         if not info:
             stmt = select(ReservationInfo).where(
                 pending_condition,
-                ReservationInfo.property_code == property_code,
+                property_condition,
             )
             results = list(self.db.execute(stmt).scalars().all())
             if len(results) == 1:

@@ -37,10 +37,11 @@ export interface PendingReservationDTO {
   nights: number | null;
   guest_count: number | null;
   expected_payout: number | null;
-  action_url: string;
+  action_url: string | null;
   status: PendingReservationStatus;
   remaining_hours: number | null;
   received_at: string | null;  // ISO format
+  airbnb_thread_id: string | null;  // for navigation from notifications
 }
 
 export interface PendingReservationListResponse {

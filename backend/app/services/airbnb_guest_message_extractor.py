@@ -111,11 +111,20 @@ def _extract_after_profile_block(lines: list[str]) -> Optional[str]:
             if stripped == "South Korea" or stripped == "Korea" or stripped == "대한민국":
                 base_idx = i
                 break
+    
+    # 3순위: "Changwon-si, South Korea" 등 도시명, 국가명 패턴
+    if base_idx is None:
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # 도시, 국가 패턴 (예: "Changwon-si, South Korea")
+            if re.match(r"^[\w\-]+,\s*(South )?Korea$", stripped, re.IGNORECASE):
+                base_idx = i
+                break
 
     if base_idx is None:
         return None
 
-    # base_idx 이후 첫 non-empty 라인부터, 다음 빈 줄 직전까지를 메시지로 본다
+    # base_idx 이후 첫 non-empty 라인부터 시작
     j = base_idx + 1
     n = len(lines)
 
@@ -125,17 +134,47 @@ def _extract_after_profile_block(lines: list[str]) -> Optional[str]:
         return None
 
     start = j
+    
+    # CTA 패턴이 나올 때까지 또는 끝까지 모두 수집
+    # (빈 줄이 있어도 계속 수집 - 게스트 메시지에 문단 구분이 있을 수 있음)
+    message_lines: list[str] = []
     k = start
-    while k < n and lines[k].strip():
+    
+    while k < n:
+        line = lines[k].strip()
+        
+        # CTA 패턴을 만나면 중단
+        is_cta = False
+        for pattern in CTA_PATTERNS:
+            if re.search(pattern, line):
+                is_cta = True
+                break
+        if is_cta:
+            break
+        
+        message_lines.append(line)
         k += 1
-
-    block_lines = [l.strip() for l in lines[start:k]]
-    block = "\n".join(block_lines).strip()
     
-    # CTA 패턴이 포함되어 있으면 그 앞까지만
-    block = _cut_before_cta(block)
+    # 수집된 라인들을 결합하되, 연속된 빈 줄은 하나의 줄바꿈으로 정리
+    result_lines: list[str] = []
+    prev_empty = False
     
-    return block.strip() or None
+    for line in message_lines:
+        if not line:
+            if not prev_empty and result_lines:  # 첫 줄이 빈 줄이면 무시
+                result_lines.append("")
+            prev_empty = True
+        else:
+            result_lines.append(line)
+            prev_empty = False
+    
+    # 마지막 빈 줄들 제거
+    while result_lines and not result_lines[-1]:
+        result_lines.pop()
+    
+    block = "\n".join(result_lines).strip()
+    
+    return block or None
 
 
 def extract_guest_message_segment(raw_text_body: str | None) -> Optional[str]:

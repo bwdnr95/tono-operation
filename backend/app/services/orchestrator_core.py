@@ -154,13 +154,43 @@ class OrchestratorService:
         """
         Draft에 대한 판단 수행
         
-        1. Reason Codes 수집
-        2. 안전장치 체크 (GLOBAL_SAFETY_GUARD)
-        3. FAQ Stats 체크 (property_faq_auto_send_stats)
-        4. 충돌 검사
-        5. 최종 Decision 산출
-        6. 로그 기록
+        1. 중복 판단 체크 (같은 Draft에 대해 이미 판단이 있으면 재사용)
+        2. Reason Codes 수집
+        3. 안전장치 체크 (GLOBAL_SAFETY_GUARD)
+        4. FAQ Stats 체크 (property_faq_auto_send_stats)
+        5. 충돌 검사
+        6. 최종 Decision 산출
+        7. 로그 기록
         """
+        # ═══════════════════════════════════════════════════════════════
+        # 0. 중복 판단 방지: 같은 Draft에 대해 최근 판단이 있으면 재사용
+        # ═══════════════════════════════════════════════════════════════
+        if evidence.draft_reply_id:
+            from sqlalchemy import select, desc
+            
+            existing = self._db.execute(
+                select(DecisionLog)
+                .where(DecisionLog.draft_id == evidence.draft_reply_id)
+                .where(DecisionLog.was_sent == False)
+                .order_by(desc(DecisionLog.created_at))
+                .limit(1)
+            ).scalar_one_or_none()
+            
+            if existing:
+                logger.info(
+                    f"Reusing existing decision for draft {evidence.draft_reply_id}: "
+                    f"decision={existing.decision}, log_id={existing.id}"
+                )
+                return DecisionResult(
+                    decision=Decision(existing.decision),
+                    reason_codes=[ReasonCode(rc) for rc in (existing.reason_codes or [])],
+                    confidence=existing.confidence or 0.5,
+                    warnings=existing.decision_details.get("warnings", []) if existing.decision_details else [],
+                    commitment_conflicts=existing.decision_details.get("conflicts", []) if existing.decision_details else [],
+                    matched_pattern_id=existing.pattern_id,
+                    decision_log_id=existing.id,
+                )
+        
         # 1. Reason Codes 수집
         reason_codes = await self._collect_reason_codes(evidence)
         
@@ -770,7 +800,14 @@ class OrchestratorService:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 2. AUTO_SEND: 안전장치 통과 + FAQ Stats eligible
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if safety_guard_passed and faq_stats_match:
+        # NEED_FOLLOW_UP은 AUTO_SEND 절대 불가 (호스트 확인 필요)
+        response_outcome = evidence.outcome_label.get("response_outcome", "") if evidence.outcome_label else ""
+        is_need_follow_up = response_outcome == "NEED_FOLLOW_UP"
+        
+        if is_need_follow_up:
+            logger.info("AUTO_SEND 차단: response_outcome=NEED_FOLLOW_UP (호스트 확인 필요)")
+            # AUTO_SEND 불가 → 아래 SUGGEST_SEND로 넘어감
+        elif safety_guard_passed and faq_stats_match:
             logger.info(
                 f"AUTO_SEND 조건 충족: safety_guard=PASS, "
                 f"faq_key={faq_stats_match.get('faq_key')}, "

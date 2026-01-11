@@ -74,6 +74,7 @@ class EmbeddingService:
         was_edited: bool = False,
         conversation_id: Optional[UUID] = None,
         airbnb_thread_id: Optional[str] = None,
+        pack_keys: Optional[List[str]] = None,
     ) -> AnswerEmbedding:
         """
         답변을 임베딩하여 저장
@@ -85,6 +86,7 @@ class EmbeddingService:
             was_edited: AI 초안이 수정되었는지 여부
             conversation_id: 대화 ID
             airbnb_thread_id: 에어비앤비 스레드 ID
+            pack_keys: 사용된 Answer Pack keys (few-shot 필터링용)
             
         Returns:
             저장된 AnswerEmbedding 객체
@@ -102,12 +104,17 @@ class EmbeddingService:
             airbnb_thread_id=airbnb_thread_id,
         )
         
+        # pack_keys 저장 (컬럼이 있는 경우)
+        if pack_keys and hasattr(answer_embedding, 'pack_keys'):
+            answer_embedding.pack_keys = pack_keys
+        
         self.db.add(answer_embedding)
         self.db.flush()
         
         logger.info(
             f"답변 임베딩 저장 완료: id={answer_embedding.id}, "
-            f"property={property_code}, edited={was_edited}"
+            f"property={property_code}, edited={was_edited}, "
+            f"pack_keys={pack_keys}"
         )
         
         return answer_embedding
@@ -118,6 +125,7 @@ class EmbeddingService:
         property_code: Optional[str] = None,
         limit: int = 3,
         min_similarity: float = 0.7,
+        include_group_pool: bool = True,
     ) -> List[SimilarAnswer]:
         """
         유사한 과거 답변 검색
@@ -127,38 +135,76 @@ class EmbeddingService:
             property_code: 특정 숙소로 필터링 (None이면 전체 검색)
             limit: 최대 결과 수
             min_similarity: 최소 유사도 (0.0 ~ 1.0)
+            include_group_pool: 그룹 공통 풀도 포함할지 (예: PV-A 검색 시 PV도 포함)
             
         Returns:
             유사도 높은 순으로 정렬된 SimilarAnswer 리스트
         """
         # 쿼리 텍스트 임베딩
         query_embedding = self.create_embedding(query_text)
-        embedding_str = str(query_embedding)
+        # pgvector 형식으로 변환 (공백 없이)
+        embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
         
-        # pgvector cosine distance: 0 = 동일, 2 = 완전 반대
-        # similarity = 1 - distance (cosine distance는 0~1 범위)
+        # SQL 쿼리 - WHERE절에서 similarity 필터링하면 버그 발생
+        # ORDER BY만 사용하고 Python에서 필터링
+        fetch_limit = limit * 3  # 필터링 후 충분한 결과 확보를 위해 더 많이 조회
         
-        # SQL 쿼리 구성 - bindparams 사용
         if property_code:
-            sql = text("""
-                SELECT 
-                    id,
-                    guest_message,
-                    final_answer,
-                    property_code,
-                    was_edited,
-                    1 - (embedding <=> cast(:query_embedding as vector)) as similarity
-                FROM answer_embeddings
-                WHERE property_code = :property_code
-                AND 1 - (embedding <=> cast(:query_embedding as vector)) >= :min_similarity
-                ORDER BY embedding <=> cast(:query_embedding as vector)
-                LIMIT :limit
-            """).bindparams(
-                query_embedding=embedding_str,
-                property_code=property_code,
-                min_similarity=min_similarity,
-                limit=limit,
-            )
+            # 그룹 공통 풀 포함 로직
+            property_codes = [property_code]
+            
+            if include_group_pool:
+                group_code = self._get_group_code_from_profile(property_code)
+                if group_code and group_code != property_code:
+                    property_codes.append(group_code)
+            
+            if len(property_codes) == 1:
+                sql = text("""
+                    SELECT 
+                        id,
+                        guest_message,
+                        final_answer,
+                        property_code,
+                        was_edited,
+                        1 - (embedding <=> cast(:query_embedding as vector)) as similarity
+                    FROM answer_embeddings
+                    WHERE property_code = :property_code
+                    ORDER BY embedding <=> cast(:query_embedding as vector)
+                    LIMIT :fetch_limit
+                """)
+                params = {
+                    "query_embedding": embedding_str,
+                    "property_code": property_code,
+                    "fetch_limit": fetch_limit,
+                }
+            else:
+                # 그룹 공통 풀 포함 (IN 절 사용)
+                placeholders = ', '.join([f':pc{i}' for i in range(len(property_codes))])
+                sql = text(f"""
+                    SELECT 
+                        id,
+                        guest_message,
+                        final_answer,
+                        property_code,
+                        was_edited,
+                        1 - (embedding <=> cast(:query_embedding as vector)) as similarity,
+                        CASE WHEN property_code = :exact_property THEN 0 ELSE 1 END as match_priority
+                    FROM answer_embeddings
+                    WHERE property_code IN ({placeholders})
+                    ORDER BY match_priority, embedding <=> cast(:query_embedding as vector)
+                    LIMIT :fetch_limit
+                """)
+                params = {
+                    "query_embedding": embedding_str,
+                    "exact_property": property_code,
+                    "fetch_limit": fetch_limit,
+                }
+                for i, pc in enumerate(property_codes):
+                    params[f"pc{i}"] = pc
+                
+                logger.info(
+                    f"Few-shot 검색 (그룹 풀 포함): property={property_code}, group={property_codes[1]}"
+                )
         else:
             sql = text("""
                 SELECT 
@@ -169,29 +215,32 @@ class EmbeddingService:
                     was_edited,
                     1 - (embedding <=> cast(:query_embedding as vector)) as similarity
                 FROM answer_embeddings
-                WHERE 1 - (embedding <=> cast(:query_embedding as vector)) >= :min_similarity
                 ORDER BY embedding <=> cast(:query_embedding as vector)
-                LIMIT :limit
-            """).bindparams(
-                query_embedding=embedding_str,
-                min_similarity=min_similarity,
-                limit=limit,
-            )
+                LIMIT :fetch_limit
+            """)
+            params = {
+                "query_embedding": embedding_str,
+                "fetch_limit": fetch_limit,
+            }
         
-        result = self.db.execute(sql)
+        result = self.db.execute(sql, params)
         rows = result.fetchall()
         
-        similar_answers = [
-            SimilarAnswer(
-                id=row.id,
-                guest_message=row.guest_message,
-                final_answer=row.final_answer,
-                property_code=row.property_code,
-                was_edited=row.was_edited,
-                similarity=float(row.similarity),
-            )
-            for row in rows
-        ]
+        # Python에서 min_similarity 필터링 및 limit 적용
+        similar_answers = []
+        for row in rows:
+            sim = float(row.similarity)
+            if sim >= min_similarity:
+                similar_answers.append(SimilarAnswer(
+                    id=row.id,
+                    guest_message=row.guest_message,
+                    final_answer=row.final_answer,
+                    property_code=row.property_code,
+                    was_edited=row.was_edited,
+                    similarity=sim,
+                ))
+                if len(similar_answers) >= limit:
+                    break
         
         logger.info(
             f"유사 답변 검색 완료: query_len={len(query_text)}, "
@@ -199,6 +248,29 @@ class EmbeddingService:
         )
         
         return similar_answers
+    
+    def _get_group_code_from_profile(self, property_code: str) -> Optional[str]:
+        """
+        property_profile에서 group_code 조회
+        
+        Args:
+            property_code: 숙소 코드
+            
+        Returns:
+            group_code (없으면 None)
+        """
+        try:
+            from app.domain.models.property_profile import PropertyProfile
+            
+            result = self.db.execute(
+                select(PropertyProfile.group_code)
+                .where(PropertyProfile.property_code == property_code)
+            ).scalar_one_or_none()
+            
+            return result
+        except Exception as e:
+            logger.warning(f"group_code 조회 실패: property={property_code}, error={e}")
+            return None
     
     def find_similar_for_few_shot(
         self,
